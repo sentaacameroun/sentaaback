@@ -1,0 +1,42 @@
+# --- CORE FRAMEWORK ---
+Django>=5.0,<5.1
+djangorestframework>=3.15.0
+django-cors-headers>=4.3.0  
+
+# --- BASE DE DONNÉES & CONFIGURATION ---
+psycopg2-binary>=2.9.0      
+django-environ>=0.11.0      
+dj-database-url>=2.1.0      
+
+# --- AUTHENTIFICATION & SÉCURITÉ ---
+djangorestframework-simplejwt>=5.3.0  
+django-axes>=6.2.0                    
+django-phonenumber-field[phonenumbers]>=7.3.0 
+# --- DOCUMENTATION API ---
+drf-spectacular>=0.27.0   
+drf-yasg>=1.21.9  
+whitenoise>=6.4.0
+
+redis>=5.0.0              
+django-redis>=5.4.0 
+django-jazzmin>=3.0.0        
+
+# --- STOCKAGE DE FICHIERS (Images produits & CVs) ---
+Pillow>=10.2.0              
+django-storages[s3]>=1.14.0 
+boto3>=1.34.0              
+
+# --- SERVEUR DE PRODUCTION ---
+gunicorn>=21.2.0            
+uvicorn[standard]>=0.27.0  
+
+# --- UTILS & QUALITÉ ---
+django-filter>=24.1.0      
+django-extensions>=3.2.0    
+
+pytest==8.4.2
+py
+pytest-django==4.11.1
+flake8>=6.0.0
+black>=23.3.0
+isort>=5.10.0
