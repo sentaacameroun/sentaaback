@@ -4,7 +4,9 @@ attrs==25.4.0
 black==26.1.0
 boto3==1.42.59
 botocore==1.42.59
+cfgv==3.5.0
 click==8.3.1
+distlib==0.4.0
 dj-database-url==3.1.2
 Django==5.0.14
 django-axes==8.3.1
@@ -20,10 +22,12 @@ djangorestframework==3.16.1
 djangorestframework_simplejwt==5.5.1
 drf-spectacular==0.29.0
 drf-yasg==1.21.15
+filelock==3.25.0
 flake8==7.3.0
 gunicorn==21.2.0
 h11==0.16.0
 httptools==0.7.1
+identify==2.6.17
 idna==3.11
 inflection==0.5.1
 iniconfig==2.3.0
@@ -33,12 +37,15 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 mccabe==0.7.0
 mypy_extensions==1.1.0
-packaging @ file:///home/task_176104874243446/conda-bld/packaging_1761049080023/work
+nodeenv==1.10.0
+packaging==25.0
 pathspec==1.0.4
 phonenumbers==9.0.25
 pillow==12.1.1
+pip==26.0.1
 platformdirs==4.9.2
 pluggy==1.6.0
+pre_commit==4.5.1
 psycopg2-binary==2.9.11
 py==1.11.0
 pycodestyle==2.14.0
@@ -48,6 +55,7 @@ PyJWT==2.11.0
 pytest==8.4.2
 pytest-django==4.11.1
 python-dateutil==2.9.0.post0
+python-discovery==1.1.0
 python-dotenv==1.2.2
 pytokens==0.4.1
 pytz==2025.2
@@ -64,6 +72,7 @@ uritemplate==4.2.0
 urllib3==2.6.3
 uvicorn==0.27.0
 uvloop==0.22.1
+virtualenv==21.1.0
 watchfiles==1.1.1
 websockets==16.0
 wheel==0.46.3
