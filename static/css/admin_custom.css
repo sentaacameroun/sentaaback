@@ -1,0 +1,86 @@
+/* ==================================================== */
+/* FORCER LE LOOK ÉPURÉ (SENTA'A STYLE)                 */
+/* ==================================================== */
+
+:root {
+    --sentaa-green: #4CAF50;
+    --sentaa-blue: #64B5F6;
+}
+
+/* Centrage total de la page de login */
+body.login-page {
+    background: #f4f7f6 !important; /* Gris très doux */
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    height: 100vh !important;
+}
+
+/* Correction de la carte de connexion qui devenait noire */
+.login-box .card {
+    background-color: #ffffff !important;
+    border: none !important;
+    border-radius: 16px !important;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.05) !important;
+    overflow: hidden;
+}
+
+.login-card-body {
+    background-color: #ffffff !important;
+    color: #333 !important;
+    padding: 2rem !important;
+}
+
+/* Fix des champs texte déformés */
+.form-control {
+    height: 48px !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 10px !important;
+    background-color: #ffffff !important;
+    color: #2c3e50 !important; /* Texte bien visible */
+    padding: 10px 15px !important;
+    box-shadow: none !important;
+}
+
+.form-control:focus {
+    border-color: var(--sentaa-green) !important;
+    background-color: #fff !important;
+}
+
+/* Fix du texte dans les inputs (parfois invisible en dark mode forcé) */
+input {
+    color: #2c3e50 !important;
+}
+
+/* Bouton Connexion */
+.btn-primary {
+    background-color: var(--sentaa-green) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    height: 48px !important;
+    font-weight: 600 !important;
+    transition: all 0.3s ease;
+}
+
+.btn-primary:hover {
+    background-color: #3d8b40 !important;
+    transform: translateY(-1px);
+}
+
+/* Harmonisation de la barre latérale (Sidebar) */
+.main-sidebar {
+    background-color: #ffffff !important;
+    border-right: 1px solid #eee !important;
+}
+
+.nav-sidebar .nav-link.active {
+    background-color: rgba(76, 175, 80, 0.1) !important;
+    color: var(--sentaa-green) !important;
+    border-radius: 8px;
+}
+
+/* Masquer les éléments inutiles qui polluent le design */
+.login-box-msg {
+    font-weight: 500;
+    color: #7f8c8d;
+}

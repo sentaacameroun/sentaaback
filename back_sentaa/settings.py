@@ -61,9 +61,11 @@ INSTALLED_APPS = [
     'escrow',
     
 ]
+CRISPY_TEMPLATE_PACK = "bootstrap4"
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -175,56 +177,34 @@ JAZZMIN_SETTINGS = {
     "related_modal_active": True,
     
     # Amélioration des messages d'erreur
-    "custom_css": "/static/css/admin_custom.css",
-    "custom_js": "/static/js/admin_custom.js",
+    # chemins mis à jour après réorganisation des fichiers statiques
+    "custom_css": "css/admin_custom.css",
+    "custom_js": "js/admin_custom.js",
 }
 
 JAZZMIN_UI_TWEAKS = {
-    # Thèmes
     "theme": "flatly",
-    "dark_mode_theme": "darkly",
+    "dark_mode_theme": None, # Désactive le thème sombre
+    "default_theme_mode": "light",
     
-    # Navigation et couleurs Senta'a (Vert clair #4CAF50, Bleu pâle #64B5F6)
-    "navbar_small_text": False,
-    "footer_small_text": False,
-    "body_small_text": False,
-    "brand_small_text": False,
-    "brand_colour": "navbar-success",  # Vert clair pour la marque
-    "accent": "accent-info",  # Bleu pâle pour les accents
+    # Couleurs Senta'a
+    "brand_colour": "navbar-white", # Fond blanc pour le logo
+    "accent": "accent-success", # Vert pour les focus
     
-    # Personnalisation des couleurs navbar
-    "navbar": "navbar-success navbar-dark",  # Navbar vert clair
+    # Navbar : on passe en LIGHT
+    "navbar": "navbar-white navbar-light", 
     "no_navbar_border": False,
     
-    # Sidebar
-    "sidebar": "sidebar-dark-success",  # Vert foncé pour la sidebar
-    "sidebar_nav_small_text": False,
-    "sidebar_disable_expand": False,
+    # Sidebar : on passe en LIGHT
+    "sidebar": "sidebar-light-success", # "light" au lieu de "dark"
     "sidebar_nav_child_indent": True,
-    "sidebar_nav_compact_style": False,
-    "sidebar_nav_legacy_style": False,
     "sidebar_nav_flat_style": True,
     
-    # Boutons
+    "theme_switcher": False, # On cache le bouton lune/soleil
     "button_classes": {
-        "primary": "btn-primary",  # Bleu pâle pour les boutons principaux
-        "secondary": "btn-secondary",
-        "info": "btn-info",
-        "warning": "btn-warning",
-        "danger": "btn-danger",
-        "success": "btn-success"  # Vert clair pour les succès
+        "primary": "btn-outline-primary",
+        "success": "btn-success",
     },
-    
-    # Options de confort
-    "theme_switcher": True,  # Bouton mode sombre/clair
-    "dark_mode_theme": "cyborg",  # Thème sombre personnalisé
-    
-    # Gestion des messages d'alerte
-    "actions_sticky_top": True,
-    
-    # Paramètres avancés
-    "navbar_fixed": True,
-    "sidebar_fixed": True,
 }
 
 
@@ -244,7 +224,7 @@ AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
     },
-]
+]   
 
 SPECTACULAR_SETTINGS = {
     'TITLE': "Senta'a API",
@@ -258,12 +238,18 @@ SPECTACULAR_SETTINGS = {
 }
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
+LANGUAGES = [
+    ("fr", "French"),
+    ("en", "English"),
+]
 
-LANGUAGE_CODE = 'en-us'
+LANGUAGE_CODE = "fr-fr"
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = "UTC"
 
 USE_I18N = True
+
+USE_L10N = True
 
 USE_TZ = True
 
