@@ -1,10 +1,18 @@
-from django.urls import path, include
+from django.urls import include
+from django.urls import path
 from rest_framework.routers import DefaultRouter
-from escrow.views import OrderViewSet, MobileMoneyWebhookView
+
+from escrow.views import MobileMoneyWebhookView
+from escrow.views import OrderViewSet
+
 router = DefaultRouter()
-router.register(r'orders', OrderViewSet, basename='order')
-router.register(r'mobile-money-webhook', MobileMoneyWebhookView, basename='mobile-money-webhook')
+router.register(r"orders", OrderViewSet, basename="order")
 
 urlpatterns = [
-    path('', include(router.urls)),
+    path("", include(router.urls)),
+    path(
+        "mobile-money-webhook/",
+        MobileMoneyWebhookView.as_view(),
+        name="mobile-money-webhook",
+    ),
 ]

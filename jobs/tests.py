@@ -1,9 +1,9 @@
-from rest_framework.test import APITestCase
 from django.core.files.uploadedfile import SimpleUploadedFile
-from users.models import User
-from jobs.models import JobOffer
 from rest_framework.test import APIClient
-from django.urls import reverse
+from rest_framework.test import APITestCase
+
+from jobs.models import JobOffer
+from users.models import User
 
 
 class JobTests(APITestCase):
@@ -27,7 +27,7 @@ class JobTests(APITestCase):
     def test_only_recruiter_can_post(self):
         self.client = APIClient()
         self.client.force_authenticate(user=self.talent)
-        response = self.client.post('/api/job-offers/', {"title": "Test"})
+        response = self.client.post("/api/job-offers/", {"title": "Test"})
         self.assertEqual(response.status_code, 403)
 
     def test_apply_to_job(self):
@@ -42,3 +42,16 @@ class JobTests(APITestCase):
             {"job": self.job.id, "cv_file": dummy_cv, "message": "Je suis motivé"},
         )
         self.assertEqual(response.status_code, 201)
+
+    def test_toggle_favorite_job_offer(self):
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.talent)
+
+        response = self.client.post(f"/api/job-offers/{self.job.id}/toggle_favorite/")
+        self.assertEqual(response.data, {"favorited": True})
+
+        favorites = self.client.get("/api/job-offers/favorites/")
+        self.assertEqual(len(favorites.data["results"]), 1)
+
+        response = self.client.post(f"/api/job-offers/{self.job.id}/toggle_favorite/")
+        self.assertEqual(response.data, {"favorited": False})

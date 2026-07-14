@@ -1,27 +1,59 @@
-import random
-from django.core.cache import cache
 import logging
+import random
+
+from django.conf import settings
+from django.core.cache import cache
+
+from users.services.emailservice import EmailDeliveryError
+from users.services.emailservice import OTPEmailService
+from users.services.smsservice import SMSDeliveryError
+from users.services.smsservice import TwilioSMSService
 
 logger = logging.getLogger(__name__)
 
+
+class OTPSendError(Exception):
+    """Raised when the OTP was generated but could not be delivered to the user."""
+
+
 class OTPService:
     @staticmethod
-    def generate_otp(phone_number):
-        """Génère un code, le stocke dans Redis pendant 5 min"""
+    def generate_otp(identifier, channel="sms"):
+        """
+        Génère un code, le stocke en cache pendant 5 min, puis l'envoie par SMS ou email selon
+        `channel`. `identifier` est le numéro de téléphone (channel='sms') ou l'email
+        (channel='email') servant de clé de cache — les deux espaces ne se recoupent jamais
+        (un numéro et une adresse email ne peuvent pas être des chaînes identiques).
+        """
         otp = str(random.randint(100000, 999999))
-        # Clé unique dans Redis : "otp_237670000000"
-        cache.set(f"otp_{phone_number}", otp, timeout=300) 
-        
-        # Simulation d'envoi SMS
-        print(f"DEBUG: Code OTP pour {phone_number} est {otp}")
-        # Ici on intègrera l'API SMS (ex: Orange, MTN ou Twilio)
+        cache.set(f"otp_{identifier}", otp, timeout=300)
+
+        if channel == "email":
+            # Pas de switch dédié comme SMS_BACKEND : EMAIL_BACKEND (settings.py, piloté par
+            # EMAIL_HOST) gère déjà "console en dev/tests, SMTP réel en prod".
+            try:
+                OTPEmailService.send_otp_email(identifier, otp)
+            except EmailDeliveryError as exc:
+                raise OTPSendError(str(exc)) from exc
+            return otp
+
+        backend = getattr(settings, "SMS_BACKEND", "console")
+        if backend == "twilio":
+            try:
+                TwilioSMSService.send_sms(identifier, f"Votre code Senta'a : {otp}")
+            except SMSDeliveryError as exc:
+                raise OTPSendError(str(exc)) from exc
+        else:
+            # Backend "console" : utilisé en dev/tests, aucun appel réseau.
+            logger.info("DEBUG: Code OTP pour %s est %s", identifier, otp)
+
         return otp
 
     @staticmethod
-    def verify_otp(phone_number, otp_code):
-        """Vérifie si le code en cache correspond"""
-        cached_otp = cache.get(f"otp_{phone_number}")
+    def verify_otp(identifier, otp_code):
+        """Vérifie si le code en cache correspond (identifier = phone_number ou email)."""
+        cached_otp = cache.get(f"otp_{identifier}")
         if cached_otp and cached_otp == otp_code:
-            cache.delete(f"otp_{phone_number}") # Code à usage unique
+            cache.delete(f"otp_{identifier}")  # Code à usage unique
             return True
         return False

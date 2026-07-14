@@ -1,0 +1,23 @@
+<p>Bonjour {{ user.first_name }},</p>
+<p>Voici les nouveautés de la semaine sur Senta'a :</p>
+
+{% if listings %}
+<h3>Nouvelles annonces</h3>
+<ul>
+  {% for listing in listings %}
+  <li>{{ listing.title }} — {{ listing.price }} XAF ({{ listing.city }})</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if job_offers %}
+<h3>Nouvelles offres d'emploi</h3>
+<ul>
+  {% for job in job_offers %}
+  <li>{{ job.title }} — {{ job.company_name }} ({{ job.location }})</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<p>— L'équipe Senta'a</p>
+<p style="font-size:11px;color:#888;">Vous recevez cet email car vous êtes inscrit à la newsletter Senta'a. Vous pouvez vous désinscrire depuis les paramètres de votre compte.</p>

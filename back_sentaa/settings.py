@@ -9,10 +9,11 @@ https://docs.djangoproject.com/en/6.0/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
-
-from pathlib import Path
-from dotenv import load_dotenv
 import os
+from pathlib import Path
+
+from celery.schedules import crontab
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -28,101 +29,166 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
-ALLOWED_HOSTS = ["sentaaback.onrender.com", "localhost"]
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "sentaaback.onrender.com,localhost").split(
+    ","
+)
 
 
 # Application definition
 
 INSTALLED_APPS = [
-    'jazzmin',
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
-    
-
-
-    'phonenumber_field',
-    'rest_framework_simplejwt',
-    'corsheaders',
-    'django_filters',
-    'drf_spectacular',
-    'rest_framework',
-    'drf_yasg',
-
-    'jobs',
-    'marketplace',
-    'logistics',
-    'users',
-    'escrow',
-    
+    "jazzmin",
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "channels",
+    "django.contrib.staticfiles",
+    "phonenumber_field",
+    "rest_framework_simplejwt",
+    "corsheaders",
+    "django_filters",
+    "drf_spectacular",
+    "rest_framework",
+    "axes",
+    "jobs",
+    "marketplace",
+    "logistics",
+    "users",
+    "escrow",
+    "chat",
+    "notifications",
+    "companies",
 ]
-CRISPY_TEMPLATE_PACK = "bootstrap4"
 
 MIDDLEWARE = [
-    'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    "django.middleware.cache.UpdateCacheMiddleware",
-    "django.middleware.cache.FetchFromCacheMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django.middleware.locale.LocaleMiddleware",
+    "axes.middleware.AxesMiddleware",
+]
+# Note : UpdateCacheMiddleware/FetchFromCacheMiddleware ("per-site cache") ont été retirés :
+# ce pattern sert du contenu anonyme identique à tout le monde, et sur une API DRF authentifiée
+# par JWT (pas par cookie de session), il rejouait la réponse mise en cache du premier utilisateur
+# à tous les suivants sur la même URL — une fuite de données entre utilisateurs.
+
+CORS_ALLOWED_ORIGINS = [
+    origin for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if origin
 ]
 
-ROOT_URLCONF = 'back_sentaa.urls'
+ROOT_URLCONF = "back_sentaa.urls"
 
 TEMPLATES = [
     {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
 ]
 
-WSGI_APPLICATION = 'back_sentaa.wsgi.application'
+WSGI_APPLICATION = "back_sentaa.wsgi.application"
+ASGI_APPLICATION = "back_sentaa.asgi.application"
 
-AUTH_USER_MODEL = 'users.User' 
-
-REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
-    'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
-    ],
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+# Redis : channel layer pour Channels (chat + suivi coursier temps réel).
+# Réutilisé par CACHES (durcissement prod). Le broker/backend Celery ci-dessous utilise une
+# DB Redis logique distincte (/2) sur la même instance pour ne pas mélanger les espaces de clés.
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {"hosts": [REDIS_URL]},
+    }
 }
 
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": os.getenv("REDIS_URL", default="redis://127.0.0.1:6379/1"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
+
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL") or (
+    REDIS_URL.rsplit("/", 1)[0] + "/2"
+)
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND") or CELERY_BROKER_URL
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "UTC"
+
+CELERY_BEAT_SCHEDULE = {
+    "check-pending-escrow-payments": {
+        "task": "notifications.tasks.check_pending_escrow_payments",
+        "schedule": crontab(minute=0),  # toutes les heures
+    },
+    "check-pending-reception-confirmations": {
+        "task": "notifications.tasks.check_pending_reception_confirmations",
+        "schedule": crontab(hour=7, minute=0),  # 1x/jour, ~8h WAT (TIME_ZONE=UTC)
+    },
+    "check-pending-job-applications": {
+        "task": "notifications.tasks.check_pending_job_applications",
+        "schedule": crontab(hour=7, minute=30),  # 1x/jour, ~8h30 WAT
+    },
+    "send-weekly-newsletter": {
+        "task": "notifications.tasks.send_weekly_newsletter",
+        "schedule": crontab(hour=7, minute=0, day_of_week=1),  # lundi matin, ~8h WAT
+    },
+}
+
+# Seuils des rappels (notifications/tasks.py), ajustables sans redéploiement de code.
+ESCROW_PENDING_REMINDER_HOURS = int(os.getenv("ESCROW_PENDING_REMINDER_HOURS", "24"))
+RECEPTION_REMINDER_DAYS = int(os.getenv("RECEPTION_REMINDER_DAYS", "3"))
+APPLICATION_REMINDER_DAYS = int(os.getenv("APPLICATION_REMINDER_DAYS", "5"))
+
+AUTH_USER_MODEL = "users.User"
+
+# django-axes protège le formulaire de connexion Django admin (via authenticate()) contre le
+# brute-force. Le flux OTP de l'API (custom, pas d'appel à authenticate()) est protégé séparément
+# par le throttle scope 'otp' ci-dessous.
+AUTHENTICATION_BACKENDS = [
+    "axes.backends.AxesStandaloneBackend",
+    "django.contrib.auth.backends.ModelBackend",
+]
+AXES_FAILURE_LIMIT = int(os.getenv("AXES_FAILURE_LIMIT", "5"))
+AXES_COOLOFF_TIME = int(os.getenv("AXES_COOLOFF_TIME", "1"))  # heures
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "100/day",
+        "user": "1000/day",
+        "otp": "5/min",
+    },
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+
 CACHES = {
     "default": {
-        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
-        "LOCATION": "cache_table",
-        "TIMEOUT": 600,
-        "OPTIONS": {"MAX_ENTRIES": 1000},
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
     }
 }
 
@@ -153,13 +219,11 @@ JAZZMIN_SETTINGS = {
     "copyright": "Senta'a Ltd",
     "search_model": ["users.User", "marketplace.Listing"],
     "user_avatar": None,
-
     # Interface
     "show_sidebar": True,
     "navigation_expanded": True,
     "hide_apps": [],
     "hide_models": [],
-    
     # Icônes
     "icons": {
         "users.User": "fas fa-user-shield",
@@ -170,12 +234,10 @@ JAZZMIN_SETTINGS = {
         "auth": "fas fa-lock",
         "admin.LogEntry": "fas fa-history",
     },
-    
     # Permet d'afficher/masquer le mot de passe
     "show_ui_builder": False,
     "changeform_format": "horizontal_tabs",
     "related_modal_active": True,
-    
     # Amélioration des messages d'erreur
     # chemins mis à jour après réorganisation des fichiers statiques
     "custom_css": "css/admin_custom.css",
@@ -184,23 +246,19 @@ JAZZMIN_SETTINGS = {
 
 JAZZMIN_UI_TWEAKS = {
     "theme": "flatly",
-    "dark_mode_theme": None, # Désactive le thème sombre
+    "dark_mode_theme": None,  # Désactive le thème sombre
     "default_theme_mode": "light",
-    
     # Couleurs Senta'a
-    "brand_colour": "navbar-white", # Fond blanc pour le logo
-    "accent": "accent-success", # Vert pour les focus
-    
+    "brand_colour": "navbar-white",  # Fond blanc pour le logo
+    "accent": "accent-success",  # Vert pour les focus
     # Navbar : on passe en LIGHT
-    "navbar": "navbar-white navbar-light", 
+    "navbar": "navbar-white navbar-light",
     "no_navbar_border": False,
-    
     # Sidebar : on passe en LIGHT
-    "sidebar": "sidebar-light-success", # "light" au lieu de "dark"
+    "sidebar": "sidebar-light-success",  # "light" au lieu de "dark"
     "sidebar_nav_child_indent": True,
     "sidebar_nav_flat_style": True,
-    
-    "theme_switcher": False, # On cache le bouton lune/soleil
+    "theme_switcher": False,  # On cache le bouton lune/soleil
     "button_classes": {
         "primary": "btn-outline-primary",
         "success": "btn-success",
@@ -213,27 +271,27 @@ JAZZMIN_UI_TWEAKS = {
 
 AUTH_PASSWORD_VALIDATORS = [
     {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
     },
-]   
+]
 
 SPECTACULAR_SETTINGS = {
-    'TITLE': "Senta'a API",
-    'DESCRIPTION': "Backend de la marketplace sécurisée Senta'a (Cameroun)",
-    'VERSION': '1.0.0',
-    'SERVE_INCLUDE_SCHEMA': False,
-    'COMPONENT_SPLIT_PATCH': True,
-    'TAGS': [
-        {'name': 'Authentification', 'description': 'Gestion des comptes et OTP'},
+    "TITLE": "Senta'a API",
+    "DESCRIPTION": "Backend de la marketplace sécurisée Senta'a (Cameroun)",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "COMPONENT_SPLIT_PATCH": True,
+    "TAGS": [
+        {"name": "Authentification", "description": "Gestion des comptes et OTP"},
     ],
 }
 # Internationalization
@@ -267,8 +325,84 @@ STATICFILES_FINDERS = [
     "django.contrib.staticfiles.finders.FileSystemFinder",
     "django.contrib.staticfiles.finders.AppDirectoriesFinder",
 ]
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 MEDIA_URL = "/media/"
 
+# Stockage média (images d'annonces, CV) : sur S3 si configuré, sinon disque local (dev).
+# Sur Render, le disque est éphémère — sans S3, les fichiers uploadés sont perdus à chaque redeploy.
+AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", "")
+AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_S3_ENDPOINT_URL = os.getenv(
+    "AWS_S3_ENDPOINT_URL", ""
+)  # pour un provider S3-compatible
+AWS_DEFAULT_ACL = None
+AWS_S3_FILE_OVERWRITE = False
+
+# django-jazzmin embarque un vendor bootstrap.bundle.min.js qui référence un .map absent du
+# package. La variante "Manifest" de whitenoise resserre les références lors du collectstatic
+# et échoue dessus ; la variante "Compressed" (sans hash de contenu, juste gzip/brotli) l'évite.
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
+    },
+    "default": (
+        {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"}
+        if AWS_STORAGE_BUCKET_NAME
+        else {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    ),
+}
+
+# HTTPS / cookies sécurisés : uniquement en prod (DEBUG=False), sinon le dev local en HTTP casse.
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SECURE_PROXY_SSL_HEADER = (
+        "HTTP_X_FORWARDED_PROTO",
+        "https",
+    )  # nécessaire derrière le proxy Render
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(
+        os.getenv("SECURE_HSTS_SECONDS", 60 * 60 * 24 * 30)
+    )  # 30 jours
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+# NotchPay (agrégateur Mobile Money : MTN MoMo + Orange Money Cameroun)
+NOTCHPAY_BASE_URL = os.getenv("NOTCHPAY_BASE_URL", "https://api.notchpay.co")
+NOTCHPAY_PUBLIC_KEY = os.getenv("NOTCHPAY_PUBLIC_KEY", "")
+NOTCHPAY_PRIVATE_KEY = os.getenv("NOTCHPAY_PRIVATE_KEY", "")
+
+# SMS OTP : "console" (défaut, log local, pas d'appel réseau — dev/tests) ou "twilio" (prod)
+SMS_BACKEND = os.getenv("SMS_BACKEND", "console")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+
+# Email (rappels + newsletter, voir notifications/) : SMTP générique si EMAIL_HOST est
+# renseigné, sinon backend "console" (log local, pas d'appel réseau — dev/tests).
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+if EMAIL_HOST:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+    EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+    EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+    EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True").lower() == "true"
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "no-reply@senta-a.com")
+
+# Logging : sortie console structurée, lisible via `docker logs` / `docker compose logs`.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {"format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "standard"},
+    },
+    "root": {"handlers": ["console"], "level": os.getenv("DJANGO_LOG_LEVEL", "INFO")},
+}
