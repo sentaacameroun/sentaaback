@@ -3,17 +3,15 @@ from phonenumber_field.serializerfields import PhoneNumberField
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
+from common.images.fields import CloudinaryImageField
+
 User = get_user_model()
 
 
 class UserSerializer(serializers.ModelSerializer):
-    # Déclaré explicitement (allow_blank=False, contrairement au défaut DRF pour un champ
-    # blank=True) : un email doit être omis/null ou valide, jamais une chaîne vide — sinon
-    # deux comptes sans email entrent en conflit sous la contrainte unique du modèle. Un champ
-    # déclaré manuellement n'hérite pas automatiquement du UniqueValidator que DRF ajoute aux
-    # champs auto-générés depuis un modèle : on le rajoute donc explicitement (skip
-    # automatiquement pour value=None, donc inoffensif pour les comptes sans email — et exclut
-    # l'instance courante lors d'un PATCH grâce à serializer_field.parent.instance).
+    courier_id_document = CloudinaryImageField(
+        read_only=True, variant="full", signed=True
+    )
     email = serializers.EmailField(
         required=False,
         allow_null=True,
@@ -39,6 +37,8 @@ class UserSerializer(serializers.ModelSerializer):
             "is_recruiter",
             "is_courier",
             "courier_application_status",
+            "courier_vehicle_type",
+            "courier_id_document",
             "is_available",
             "latitude",
             "longitude",
@@ -52,8 +52,18 @@ class UserSerializer(serializers.ModelSerializer):
             "is_recruiter",
             "is_courier",
             "courier_application_status",
+            "courier_vehicle_type",
             "location_updated_at",
         ]
+
+    def validate_is_available(self, value):
+        # Seul un coursier peut se déclarer disponible (audit MINEUR #16).
+        # `is_courier` étant read-only, on se fie à l'état persisté de l'instance.
+        if value and not (self.instance and self.instance.is_courier):
+            raise serializers.ValidationError(
+                "Seuls les coursiers peuvent se déclarer disponibles."
+            )
+        return value
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -78,11 +88,6 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 
 class OTPRequestSerializer(serializers.Serializer):
-    """
-    Connexion par téléphone (SMS) ou email — l'un des deux, pas les deux. L'email n'est
-    utilisable que s'il a été renseigné sur le compte (voir /api/me/ ou l'inscription).
-    """
-
     phone_number = PhoneNumberField(required=False)
     email = serializers.EmailField(required=False)
 

@@ -44,8 +44,13 @@ def check_pending_escrow_payments():
 @shared_task
 def check_pending_reception_confirmations():
     threshold = timezone.now() - timedelta(days=settings.RECEPTION_REMINDER_DAYS)
+    # Flux en deux étapes (PR 3) : l'acheteur ne peut confirmer la réception qu'à partir
+    # de `delivered` (le coursier a fait `shipped → delivered`). Rappeler un acheteur dont
+    # la commande est encore `shipped` le pousserait vers une action qui renvoie 400.
+    # `updated_at` est tamponné au passage `delivered`, donc le seuil se mesure bien depuis
+    # la livraison. Voir escrow/services/order_lifecycle.py::complete_and_release.
     orders = Order.objects.filter(
-        status="shipped",
+        status="delivered",
         reception_reminder_sent_at__isnull=True,
         updated_at__lt=threshold,
     ).select_related("buyer", "listing")

@@ -1,3 +1,5 @@
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters
 from rest_framework import permissions
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -6,20 +8,36 @@ from rest_framework.response import Response
 from jobs.models import JobApplication
 from jobs.models import JobOffer
 from jobs.models import JobOfferFavorite
-from jobs.permissions import IsRecruiter
+from jobs.permissions import IsApplicationRecruiter
+from jobs.permissions import IsOwnerRecruiter
+from jobs.permissions import IsVerifiedRecruiter
 from jobs.serializers import JobApplicationSerializer
 from jobs.serializers import JobOfferSerializer
 
 
 class JobOfferViewSet(viewsets.ModelViewSet):
-    queryset = JobOffer.objects.filter(is_active=True)
     serializer_class = JobOfferSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["recruiter"]
+    search_fields = ["title", "company_name", "description"]
+
+    def get_queryset(self):
+        # Un recruteur consultant ses PROPRES offres (Espace Entreprise > Mes offres,
+        # `?recruiter=<son_id>`) doit voir aussi celles qu'il a désactivées, pas seulement
+        # les actives visibles du grand public.
+        user = self.request.user
+        recruiter_param = self.request.query_params.get("recruiter")
+        if user.is_authenticated and recruiter_param == str(user.id):
+            return JobOffer.objects.all()
+        return JobOffer.objects.filter(is_active=True)
 
     def get_permissions(self):
         if self.action in ("toggle_favorite", "favorites"):
             return [permissions.IsAuthenticated()]
-        if self.action in ["create", "update", "partial_update", "destroy"]:
-            return [IsRecruiter()]
+        if self.action == "create":
+            return [IsVerifiedRecruiter()]
+        if self.action in ("update", "partial_update", "destroy"):
+            return [IsOwnerRecruiter()]
         return [permissions.AllowAny()]
 
     def perform_create(self, serializer):
@@ -59,5 +77,31 @@ class JobApplicationViewSet(viewsets.ModelViewSet):
             return JobApplication.objects.filter(job__recruiter=user)
         return JobApplication.objects.filter(applicant=user)
 
+    def get_permissions(self):
+        if self.action in ("accept", "reject", "mark_reviewed"):
+            return [permissions.IsAuthenticated(), IsApplicationRecruiter()]
+        return super().get_permissions()
+
     def perform_create(self, serializer):
         serializer.save(applicant=self.request.user)
+
+    # `JobApplicationSerializer.status` est en lecture seule pour tout le monde (y compris
+    # le recruteur) — jusqu'ici aucun endpoint ne permettait à un recruteur de répondre à une
+    # candidature reçue. Même pattern que `marketplace.OfferViewSet` (accept/reject).
+    def _respond(self, request, pk, new_status):
+        application = self.get_object()
+        application.status = new_status
+        application.save(update_fields=["status"])
+        return Response(JobApplicationSerializer(application).data)
+
+    @action(detail=True, methods=["post"])
+    def accept(self, request, pk=None):
+        return self._respond(request, pk, "accepted")
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        return self._respond(request, pk, "rejected")
+
+    @action(detail=True, methods=["post"], url_path="mark_reviewed")
+    def mark_reviewed(self, request, pk=None):
+        return self._respond(request, pk, "reviewed")

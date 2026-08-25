@@ -63,6 +63,29 @@ class NotificationTasksTests(TestCase):
         self.assertEqual(len(mail.outbox), 1)
 
     def test_check_pending_reception_confirmations(self):
+        # L'acheteur ne peut confirmer la réception qu'à partir de `delivered` (flux en
+        # deux étapes, PR 3) : c'est donc ce statut que le rappel doit cibler.
+        old = timezone.now() - timedelta(days=10)
+        order = Order.objects.create(
+            buyer=self.buyer,
+            listing=self.listing,
+            item_price=1000,
+            service_fee=30,
+            total_amount=1030,
+            status="delivered",
+        )
+        Order.objects.filter(id=order.id).update(updated_at=old)
+
+        sent = check_pending_reception_confirmations()
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(mail.outbox), 1)
+        order.refresh_from_db()
+        self.assertIsNotNone(order.reception_reminder_sent_at)
+
+    def test_shipped_order_not_reminded_for_reception(self):
+        # Régression : une commande encore `shipped` (coursier n'a pas confirmé la
+        # livraison) ne doit PAS déclencher de rappel de réception — l'acheteur ne peut
+        # pas encore confirmer (confirm_reception renverrait 400).
         old = timezone.now() - timedelta(days=10)
         order = Order.objects.create(
             buyer=self.buyer,
@@ -75,8 +98,8 @@ class NotificationTasksTests(TestCase):
         Order.objects.filter(id=order.id).update(updated_at=old)
 
         sent = check_pending_reception_confirmations()
-        self.assertEqual(sent, 1)
-        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(sent, 0)
+        self.assertEqual(len(mail.outbox), 0)
 
     def test_check_pending_job_applications(self):
         job = JobOffer.objects.create(

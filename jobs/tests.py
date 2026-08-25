@@ -33,8 +33,12 @@ class JobTests(APITestCase):
     def test_apply_to_job(self):
         self.client = APIClient()
         self.client.force_authenticate(user=self.talent)
+        # Un vrai PDF commence par la signature `%PDF-` (la validation de contenu, pas
+        # seulement l'extension, l'exige désormais).
         dummy_cv = SimpleUploadedFile(
-            "cv.pdf", b"file_content", content_type="application/pdf"
+            "cv.pdf",
+            b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nendobj\n%%EOF",
+            content_type="application/pdf",
         )
 
         response = self.client.post(
@@ -42,6 +46,38 @@ class JobTests(APITestCase):
             {"job": self.job.id, "cv_file": dummy_cv, "message": "Je suis motivé"},
         )
         self.assertEqual(response.status_code, 201)
+
+    def test_rejects_cv_that_is_not_a_real_pdf(self):
+        # Régression : le `.pdf` dans le nom ne suffit pas. Un fichier renommé (ici un
+        # faux binaire) passait le `FileExtensionValidator` mais n'est pas un vrai PDF.
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.talent)
+        fake_cv = SimpleUploadedFile(
+            "cv.pdf", b"MZ\x90\x00 pas un pdf", content_type="application/pdf"
+        )
+        response = self.client.post(
+            "/api/job-applications/",
+            {"job": self.job.id, "cv_file": fake_cv, "message": "x"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_rejects_oversized_cv(self):
+        # Régression : aucune limite de taille n'existait, un upload pouvait saturer le
+        # stockage. Le fichier a bien la signature PDF pour isoler le contrôle de taille.
+        from jobs.serializers import MAX_CV_BYTES
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.talent)
+        oversized = SimpleUploadedFile(
+            "cv.pdf",
+            b"%PDF-1.4\n" + b"0" * (MAX_CV_BYTES + 1),
+            content_type="application/pdf",
+        )
+        response = self.client.post(
+            "/api/job-applications/",
+            {"job": self.job.id, "cv_file": oversized, "message": "x"},
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_toggle_favorite_job_offer(self):
         self.client = APIClient()

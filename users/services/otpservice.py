@@ -1,5 +1,5 @@
 import logging
-import random
+import secrets
 
 from django.conf import settings
 from django.core.cache import cache
@@ -25,7 +25,10 @@ class OTPService:
         (channel='email') servant de clé de cache — les deux espaces ne se recoupent jamais
         (un numéro et une adresse email ne peuvent pas être des chaînes identiques).
         """
-        otp = str(random.randint(100000, 999999))
+        # Générateur cryptographique (secrets) plutôt que random.randint (MINEUR #13),
+        # cohérent avec logistics/models.py. randbelow(1_000_000) → 0..999999, zéro-paddé
+        # sur 6 chiffres (les codes à zéros de tête restent valides).
+        otp = f"{secrets.randbelow(1_000_000):06d}"
         cache.set(f"otp_{identifier}", otp, timeout=300)
 
         if channel == "email":

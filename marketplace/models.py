@@ -1,16 +1,47 @@
 import uuid
 
+from cloudinary.models import CloudinaryField
+from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
 
+from common.images.validators import ImageFileValidator
 from users.models import User
+
+
+# Fonctions nommées au niveau module (pas des lambdas) : `makemigrations` doit pouvoir les
+# sérialiser par chemin d'import dans le fichier de migration.
+def category_icon_public_id(instance):
+    # Déterministe par catégorie : remplacer l'icône (admin) écrase l'existante sur Cloudinary
+    # (overwrite=True ci-dessous) au lieu d'en laisser une orpheline.
+    return f"{settings.CLOUDINARY_FOLDER_PREFIX}/categories/icons/{instance.id}"
+
+
+def listing_image_public_id(instance):
+    # Une ListingImage = une image permanente et distincte (jamais remplacée en place, voir
+    # marketplace/views.py::_attach_uploaded_images) : id de ligne pas encore connu à ce stade
+    # (PK auto-incrémentée, assignée seulement après l'INSERT), d'où l'uuid4 dédié plutôt que
+    # `instance.pk`. `listing_id` regroupe les images d'une même annonce dans un même dossier.
+    return f"{settings.CLOUDINARY_FOLDER_PREFIX}/listings/{instance.listing_id}/{uuid.uuid4()}"
 
 
 class Category(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=100, verbose_name="Nom")
     slug = models.SlugField(unique=True)
-    icon = models.ImageField(upload_to="categories/", null=True, blank=True)
+    icon = CloudinaryField(
+        resource_type="image",
+        type="upload",
+        public_id=category_icon_public_id,
+        overwrite=True,
+        invalidate=True,
+        unique_filename=False,
+        use_filename=False,
+        allowed_formats=["jpg", "jpeg", "png", "webp"],
+        validators=[ImageFileValidator(max_bytes=2 * 1024 * 1024)],
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         verbose_name = "Catégorie"
@@ -67,7 +98,16 @@ class ListingImage(models.Model):
     listing = models.ForeignKey(
         Listing, on_delete=models.CASCADE, related_name="images"
     )
-    image = models.ImageField(upload_to="listings/")
+    image = CloudinaryField(
+        resource_type="image",
+        type="upload",
+        public_id=listing_image_public_id,
+        overwrite=False,  # chaque ligne est une image distincte, jamais remplacée en place
+        unique_filename=False,
+        use_filename=False,
+        allowed_formats=["jpg", "jpeg", "png", "webp"],
+        validators=[ImageFileValidator(max_bytes=5 * 1024 * 1024)],
+    )
     is_main = models.BooleanField(default=False)  # Image de couverture
 
     def __str__(self):

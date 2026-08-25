@@ -1,5 +1,7 @@
 from decimal import Decimal
+from unittest.mock import patch
 
+from channels.db import database_sync_to_async
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
 from django.test import TransactionTestCase
@@ -13,6 +15,7 @@ from .models import Delivery
 from .services import notify_nearby_couriers
 from chat.middleware import JWTAuthMiddleware
 from escrow.models import Order
+from escrow.models import PaymentTransaction
 from escrow.services.delivery_hooks import on_order_paid
 from marketplace.models import Category
 from marketplace.models import Listing
@@ -215,6 +218,95 @@ class LogisticsTests(APITestCase):
         response = client.post(f"/api/deliveries/{delivery.id}/claim/")
         self.assertEqual(response.status_code, 409)
 
+    def _advance_to_in_transit(self, delivery):
+        client = APIClient()
+        client.force_authenticate(user=self.courier)
+        client.post(
+            f"/api/deliveries/{delivery.id}/update-status/", {"status": "picked_up"}
+        )
+        client.post(
+            f"/api/deliveries/{delivery.id}/update-status/", {"status": "in_transit"}
+        )
+        delivery.refresh_from_db()
+        return delivery
+
+    @patch("escrow.services.payouts.NotchPayClient.initialize_transfer")
+    def test_confirm_delivery_marks_delivered_and_pays_courier_only(
+        self, mock_transfer
+    ):
+        # Flux PR 3 côté coursier : la saisie du code fait passer la commande
+        # shipped → delivered et paie le coursier, mais NE libère PAS les fonds au vendeur
+        # (seule la confirmation acheteur le fait). Correctif du double reversement
+        # (BLOQUANT #1) : le coursier ne clôture plus la commande.
+        mock_transfer.return_value = {"transaction": {"reference": "courier-ref"}}
+        delivery = Delivery.objects.create(
+            order=self.order, courier=self.courier, status="assigned"
+        )
+        code = delivery.confirmation_code
+        self._advance_to_in_transit(delivery)
+
+        client = APIClient()
+        client.force_authenticate(user=self.courier)
+        response = client.post(
+            f"/api/deliveries/{delivery.id}/confirm-delivery/", {"code": code}
+        )
+        self.assertEqual(response.status_code, 200)
+
+        delivery.refresh_from_db()
+        self.order.refresh_from_db()
+        self.assertEqual(delivery.status, "delivered")
+        # La commande est `delivered`, PAS `completed` : les fonds vendeur restent bloqués.
+        self.assertEqual(self.order.status, "delivered")
+        self.assertTrue(
+            PaymentTransaction.objects.filter(
+                order=self.order, transaction_type="courier_payout"
+            ).exists()
+        )
+        self.assertFalse(
+            PaymentTransaction.objects.filter(
+                order=self.order, transaction_type="withdraw"
+            ).exists()
+        )
+
+    @patch("escrow.services.payouts.NotchPayClient.initialize_transfer")
+    def test_two_step_closure_courier_then_buyer_releases_once(self, mock_transfer):
+        # Bout-en-bout : le coursier livre (delivered) puis l'acheteur confirme (completed +
+        # un seul virement vendeur). Vérifie qu'un unique reversement `withdraw` est créé —
+        # les deux chemins ne libèrent plus les fonds chacun de leur côté.
+        # Références distinctes par appel : le payout coursier et le reversement vendeur
+        # créent chacun une PaymentTransaction dont l'external_ref est unique.
+        mock_transfer.side_effect = [
+            {"transaction": {"reference": "courier-ref"}},
+            {"transaction": {"reference": "seller-ref"}},
+        ]
+        delivery = Delivery.objects.create(
+            order=self.order, courier=self.courier, status="assigned"
+        )
+        code = delivery.confirmation_code
+        self._advance_to_in_transit(delivery)
+
+        courier_client = APIClient()
+        courier_client.force_authenticate(user=self.courier)
+        courier_client.post(
+            f"/api/deliveries/{delivery.id}/confirm-delivery/", {"code": code}
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "delivered")
+
+        buyer_client = APIClient()
+        buyer_client.force_authenticate(user=self.buyer)
+        response = buyer_client.post(f"/api/orders/{self.order.id}/confirm_reception/")
+        self.assertEqual(response.status_code, 200)
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "completed")
+        self.assertEqual(
+            PaymentTransaction.objects.filter(
+                order=self.order, transaction_type="withdraw"
+            ).count(),
+            1,
+        )
+
 
 class CourierDispatchTests(TransactionTestCase):
     def setUp(self):
@@ -282,19 +374,23 @@ class CourierDispatchTests(TransactionTestCase):
         )
         return JWTAuthMiddleware(router)
 
+    @database_sync_to_async
     def _token(self, user):
         return str(RefreshToken.for_user(user).access_token)
 
     async def test_only_nearby_available_courier_is_notified(self):
+        token = await self._token(self.near_courier)
+        token1 = await self._token(self.far_courier)
+        token2 = await self._token(self.offline_courier)
         near_comm = WebsocketCommunicator(
-            self._app(), f"/ws/courier/dispatch/?token={self._token(self.near_courier)}"
+            self._app(), f"/ws/courier/dispatch/?token={token}"
         )
         far_comm = WebsocketCommunicator(
-            self._app(), f"/ws/courier/dispatch/?token={self._token(self.far_courier)}"
+            self._app(), f"/ws/courier/dispatch/?token={token1}"
         )
         offline_comm = WebsocketCommunicator(
             self._app(),
-            f"/ws/courier/dispatch/?token={self._token(self.offline_courier)}",
+            f"/ws/courier/dispatch/?token={token2}",
         )
         self.assertTrue((await near_comm.connect())[0])
         self.assertTrue((await far_comm.connect())[0])
@@ -323,8 +419,9 @@ class CourierDispatchTests(TransactionTestCase):
         stranger = await database_sync_to_async(User.objects.create_user)(
             phone_number="+237611100099", first_name="S", last_name="T"
         )
+        token = await self._token(stranger)
         comm = WebsocketCommunicator(
-            self._app(), f"/ws/courier/dispatch/?token={self._token(stranger)}"
+            self._app(), f"/ws/courier/dispatch/?token={token}"
         )
         connected, _ = await comm.connect()
         self.assertFalse(connected)

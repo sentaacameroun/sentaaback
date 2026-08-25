@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.images.fields import CloudinaryImageField
+from escrow.models import Order
 from marketplace.models import Category
 from marketplace.models import Listing
 from marketplace.models import ListingImage
@@ -7,12 +9,22 @@ from marketplace.models import Offer
 
 
 class CategorySerializer(serializers.ModelSerializer):
+    # Champ modèle `CloudinaryField` (voir marketplace/models.py) : `ModelSerializer` ne sait
+    # pas le mapper automatiquement, d'où la déclaration explicite. Lecture seule : l'icône
+    # n'est éditable que via l'admin (`CategoryViewSet` est en lecture seule, voir
+    # marketplace/views.py), donc pas besoin de valider un upload ici.
+    icon = CloudinaryImageField(read_only=True, variant="thumbnail")
+
     class Meta:
         model = Category
         fields = "__all__"
 
 
 class ListingImageSerializer(serializers.ModelSerializer):
+    # Idem : upload géré explicitement dans `ListingViewSet._attach_uploaded_images` (voir
+    # marketplace/views.py), pas via ce serializer — lecture seule ici.
+    image = CloudinaryImageField(read_only=True, variant="card")
+
     class Meta:
         model = ListingImage
         fields = ["id", "image", "is_main"]
@@ -25,6 +37,11 @@ class ListingSerializer(serializers.ModelSerializer):
     company_name = serializers.ReadOnlyField(source="company.name")
     company_verified = serializers.ReadOnlyField(source="company.is_verified")
     is_favorited = serializers.SerializerMethodField()
+    # Signal de confiance pour un vendeur PARTICULIER (les entreprises ont déjà
+    # `company_verified`, mais rien n'existe côté `users.User` pour un particulier — pas de
+    # KYC/vérification réelle). Plutôt qu'un faux badge "vérifié", on expose un compteur réel :
+    # le nombre de commandes déjà menées à terme par ce vendeur, tous listings confondus.
+    seller_completed_sales_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Listing
@@ -38,15 +55,17 @@ class ListingSerializer(serializers.ModelSerializer):
             "category_name",
             "seller",
             "seller_name",
+            "seller_completed_sales_count",
             "company",
             "company_name",
             "company_verified",
             "status",
+            "is_promoted",
             "images",
             "is_favorited",
             "created_at",
         ]
-        read_only_fields = ["seller", "status"]
+        read_only_fields = ["seller", "status", "is_promoted"]
 
     def validate_price(self, value):
         if value <= 0:
@@ -60,14 +79,28 @@ class ListingSerializer(serializers.ModelSerializer):
             return False
         return obj.favorited_by.filter(user=user).exists()
 
+    def get_seller_completed_sales_count(self, obj):
+        return Order.objects.filter(
+            listing__seller_id=obj.seller_id, status="completed"
+        ).count()
+
 
 class OfferSerializer(serializers.ModelSerializer):
+    listing_title = serializers.ReadOnlyField(source="listing.title")
+    seller = serializers.ReadOnlyField(source="listing.seller_id")
+    seller_name = serializers.ReadOnlyField(source="listing.seller.first_name")
+    buyer_name = serializers.ReadOnlyField(source="buyer.first_name")
+
     class Meta:
         model = Offer
         fields = [
             "id",
             "listing",
+            "listing_title",
             "buyer",
+            "buyer_name",
+            "seller",
+            "seller_name",
             "proposed_price",
             "status",
             "last_offered_by",

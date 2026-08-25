@@ -9,7 +9,9 @@ https://docs.djangoproject.com/en/6.0/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
+
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from celery.schedules import crontab
@@ -49,11 +51,13 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "phonenumber_field",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "django_filters",
     "drf_spectacular",
     "rest_framework",
     "axes",
+    "cloudinary",
     "jobs",
     "marketplace",
     "logistics",
@@ -144,12 +148,26 @@ CELERY_BEAT_SCHEDULE = {
         "task": "notifications.tasks.send_weekly_newsletter",
         "schedule": crontab(hour=7, minute=0, day_of_week=1),  # lundi matin, ~8h WAT
     },
+    # Réconciliation des reversements Mobile Money bloqués (BLOQUANT #12) : les transferts
+    # sont asynchrones et sans webhook de statut → cette tâche interroge /transfers/{ref}.
+    "reconcile-pending-payouts": {
+        "task": "escrow.tasks.reconcile_pending_payouts",
+        "schedule": crontab(minute="*/15"),  # tous les quarts d'heure
+    },
 }
 
 # Seuils des rappels (notifications/tasks.py), ajustables sans redéploiement de code.
 ESCROW_PENDING_REMINDER_HOURS = int(os.getenv("ESCROW_PENDING_REMINDER_HOURS", "24"))
 RECEPTION_REMINDER_DAYS = int(os.getenv("RECEPTION_REMINDER_DAYS", "3"))
 APPLICATION_REMINDER_DAYS = int(os.getenv("APPLICATION_REMINDER_DAYS", "5"))
+
+# Réconciliation des reversements (escrow/tasks.py) : délai avant de considérer un transfert
+# `pending` comme bloqué, et nombre max de re-vérifications avant escalade manuelle (borne le
+# retry — pas de boucle infinie silencieuse).
+PAYOUT_RECONCILIATION_MINUTES = int(os.getenv("PAYOUT_RECONCILIATION_MINUTES", "30"))
+PAYOUT_RECONCILIATION_MAX_ATTEMPTS = int(
+    os.getenv("PAYOUT_RECONCILIATION_MAX_ATTEMPTS", "5")
+)
 
 AUTH_USER_MODEL = "users.User"
 
@@ -179,9 +197,23 @@ REST_FRAMEWORK = {
         "anon": "100/day",
         "user": "1000/day",
         "otp": "5/min",
+        "delivery_confirmation": "5/min",
     },
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+}
+
+# JWT (SimpleJWT). Durées de vie explicites au lieu des défauts implicites :
+# access court (limite la fenêtre d'un token volé), refresh plus long (confort).
+# ROTATE_REFRESH_TOKENS : chaque refresh émet un nouveau refresh token ;
+# BLACKLIST_AFTER_ROTATION blackliste l'ancien (nécessite l'app token_blacklist,
+# ajoutée à INSTALLED_APPS) — un refresh token rejoué après rotation est refusé.
+# Le logout (users/views.py::LogoutView) blackliste explicitement le refresh fourni.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 CACHES = {
@@ -355,6 +387,24 @@ STORAGES = {
     ),
 }
 
+# Cloudinary : stockage des IMAGES uniquement (logos entreprise, icônes catégorie, photos
+# d'annonces, pièce d'identité coursier — voir les champs `CloudinaryField` dans
+# users/marketplace/companies/models.py et la validation/URLs partagées dans common/images/).
+# Les autres fichiers (CV en PDF, jobs.JobApplication.cv_file) restent sur le stockage
+# ci-dessus (S3/local) : ce n'est pas de l'image, ça n'a pas sa place sur le plan gratuit
+# Cloudinary dont le quota (25 crédits/mois) est déjà dimensionné pour les seules images.
+# "cloudinary" dans INSTALLED_APPS ci-dessus est nécessaire pour que le SDK lise ce dict.
+CLOUDINARY = {
+    "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME", ""),
+    "api_key": os.getenv("CLOUDINARY_API_KEY", ""),
+    "api_secret": os.getenv("CLOUDINARY_API_SECRET", ""),
+    "secure": True,
+}
+# Préfixe de dossier Cloudinary (organisation uniquement — le quota du plan gratuit est
+# partagé par COMPTE, pas par dossier ; utiliser un compte distinct pour dev/staging si on
+# veut vraiment isoler la consommation d'un environnement de test).
+CLOUDINARY_FOLDER_PREFIX = os.getenv("CLOUDINARY_FOLDER_PREFIX", "sentaa")
+
 # HTTPS / cookies sécurisés : uniquement en prod (DEBUG=False), sinon le dev local en HTTP casse.
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
@@ -374,6 +424,10 @@ if not DEBUG:
 NOTCHPAY_BASE_URL = os.getenv("NOTCHPAY_BASE_URL", "https://api.notchpay.co")
 NOTCHPAY_PUBLIC_KEY = os.getenv("NOTCHPAY_PUBLIC_KEY", "")
 NOTCHPAY_PRIVATE_KEY = os.getenv("NOTCHPAY_PRIVATE_KEY", "")
+# « Webhook hash » NotchPay : secret HMAC-SHA256 vérifiant la signature `x-notch-signature`
+# du webhook (escrow/views.py). Vide = pas de vérification de signature (dev/tests), la
+# re-vérification via l'API reste la mitigation. Voir REFACTOR_PLAN.md (PR 5).
+NOTCHPAY_WEBHOOK_HASH = os.getenv("NOTCHPAY_WEBHOOK_HASH", "")
 
 # SMS OTP : "console" (défaut, log local, pas d'appel réseau — dev/tests) ou "twilio" (prod)
 SMS_BACKEND = os.getenv("SMS_BACKEND", "console")

@@ -5,17 +5,30 @@ from .models import Listing
 from .models import ListingFavorite
 from .models import ListingImage
 from .models import Offer
+from common.images.admin import image_preview_html
 
 
 class ListingImageInline(admin.TabularInline):
     model = ListingImage
     extra = 1
+    fields = ("image", "is_main", "image_preview")
+    readonly_fields = ("image_preview",)
+
+    @admin.display(description="Aperçu")
+    def image_preview(self, obj):
+        return image_preview_html(obj.image, height=80)
 
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
     list_display = ("name", "slug")
     prepopulated_fields = {"slug": ("name",)}
+    fields = ("name", "slug", "icon", "icon_preview")
+    readonly_fields = ("icon_preview",)
+
+    @admin.display(description="Aperçu")
+    def icon_preview(self, obj):
+        return image_preview_html(obj.icon, height=80)
 
 
 @admin.register(Listing)

@@ -7,12 +7,6 @@ class NotchPayError(Exception):
 
 
 class NotchPayClient:
-    """
-    Thin HTTP client for the NotchPay API (collection + payout for
-    MTN MoMo / Orange Money Cameroon). Public key is used to initiate
-    payments, private key for sensitive server-side calls (verify, transfer).
-    """
-
     def __init__(self):
         self.base_url = settings.NOTCHPAY_BASE_URL.rstrip("/")
         self.public_key = settings.NOTCHPAY_PUBLIC_KEY
@@ -63,3 +57,13 @@ class NotchPayClient:
             },
         }
         return self._request("POST", "/transfers", self.private_key, json=payload)
+
+    def verify_transfer(self, reference):
+        """
+        Statut d'un reversement (transfer/payout). Endpoint distinct de `verify_payment`
+        (`/payments/{ref}`, réservé aux collectes) : un transfert Mobile Money est
+        asynchrone et peut rester `pending` après l'appel `initialize_transfer` — seul
+        `/transfers/{ref}` en donne le statut final, ce qui permet la réconciliation des
+        reversements bloqués (escrow/tasks.py::reconcile_pending_payouts).
+        """
+        return self._request("GET", f"/transfers/{reference}", self.private_key)

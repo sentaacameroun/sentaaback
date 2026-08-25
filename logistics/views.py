@@ -1,26 +1,41 @@
+import logging
+import secrets
+from datetime import timedelta
+
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import mixins
 from rest_framework import permissions
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
+from escrow.services.order_lifecycle import OrderLifecycleService
+from escrow.services.payouts import pay_courier_for_delivery
 from logistics.models import Delivery
 from logistics.permissions import IsAssignedCourier
 from logistics.permissions import IsCourier
 from logistics.serializers import DeliveryAssignSerializer
+from logistics.serializers import DeliveryConfirmSerializer
 from logistics.serializers import DeliveryLocationUpdateSerializer
 from logistics.serializers import DeliverySerializer
 from logistics.serializers import DeliveryStatusUpdateSerializer
 
-# Machine à états : depuis quel statut peut-on aller vers quels statuts suivants.
+logger = logging.getLogger(__name__)
+
+CONFIRMATION_MAX_ATTEMPTS = 5
+CONFIRMATION_LOCKOUT_MINUTES = 15
+
+
 TRANSITIONS = {
     "assigned": {"picked_up", "failed"},
     "picked_up": {"in_transit", "failed"},
-    "in_transit": {"delivered", "failed"},
+    "in_transit": {"failed"},
 }
 
 
@@ -33,6 +48,8 @@ class DeliveryViewSet(
     """
 
     serializer_class = DeliverySerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["order"]
 
     def get_queryset(self):
         user = self.request.user
@@ -50,9 +67,15 @@ class DeliveryViewSet(
             return [permissions.IsAdminUser()]
         if self.action == "claim":
             return [permissions.IsAuthenticated(), IsCourier()]
-        if self.action in ("update_status", "update_location"):
+        if self.action in ("update_status", "update_location", "confirm_delivery"):
             return [permissions.IsAuthenticated(), IsAssignedCourier()]
         return [permissions.IsAuthenticated()]
+
+    def get_throttles(self):
+        if self.action == "confirm_delivery":
+            self.throttle_scope = "delivery_confirmation"
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
 
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
@@ -64,16 +87,10 @@ class DeliveryViewSet(
         delivery.status = "assigned"
         delivery.assigned_at = timezone.now()
         delivery.save(update_fields=["courier", "status", "assigned_at"])
-        return Response(DeliverySerializer(delivery).data)
+        return Response(self.get_serializer(delivery).data)
 
     @action(detail=True, methods=["post"])
     def claim(self, request, pk=None):
-        """
-        Auto-attribution "premier arrivé, premier servi" : un coursier en ligne réclame une
-        livraison notifiée (ou non — voir notify_nearby_couriers) par son id. Update atomique
-        conditionnel : si un autre coursier a déjà réclamé entre-temps, 0 ligne affectée -> 409.
-        Coexiste en permanence avec `assign/` (staff) ; le staff peut réassigner à tout moment.
-        """
         updated = Delivery.objects.filter(
             pk=pk, status="pending_assignment", courier__isnull=True
         ).update(courier=request.user, status="assigned", assigned_at=timezone.now())
@@ -82,7 +99,7 @@ class DeliveryViewSet(
                 {"error": "Cette livraison n'est plus disponible."}, status=409
             )
         delivery = Delivery.objects.get(pk=pk)
-        return Response(DeliverySerializer(delivery).data)
+        return Response(self.get_serializer(delivery).data)
 
     @action(detail=True, methods=["post"], url_path="update-status")
     def update_status(self, request, pk=None):
@@ -113,12 +130,74 @@ class DeliveryViewSet(
             order = delivery.order
             order.status = "shipped"
             order.save(update_fields=["status"])
-        elif new_status == "delivered":
-            delivery.delivered_at = now
-            update_fields.append("delivered_at")
 
         delivery.save(update_fields=update_fields)
-        return Response(DeliverySerializer(delivery).data)
+        return Response(self.get_serializer(delivery).data)
+
+    @action(detail=True, methods=["post"], url_path="confirm-delivery")
+    def confirm_delivery(self, request, pk=None):
+        delivery = self.get_object()
+
+        if delivery.status != "in_transit":
+            return Response(
+                {"error": "La livraison n'est pas en cours de livraison"}, status=400
+            )
+        if (
+            delivery.confirmation_locked_until
+            and delivery.confirmation_locked_until > timezone.now()
+        ):
+            return Response(
+                {"error": "Trop de tentatives, réessaie plus tard"}, status=429
+            )
+
+        serializer = DeliveryConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        code = serializer.validated_data["code"]
+
+        with transaction.atomic():
+            delivery = Delivery.objects.select_for_update().get(pk=delivery.pk)
+            if delivery.status != "in_transit":
+                return Response(
+                    {"error": "La livraison n'est pas en cours de livraison"},
+                    status=400,
+                )
+            if (
+                delivery.confirmation_locked_until
+                and delivery.confirmation_locked_until > timezone.now()
+            ):
+                return Response(
+                    {"error": "Trop de tentatives, réessaie plus tard"}, status=429
+                )
+
+            if not secrets.compare_digest(code, delivery.confirmation_code):
+                delivery.confirmation_attempts += 1
+                update_fields = ["confirmation_attempts"]
+                if delivery.confirmation_attempts >= CONFIRMATION_MAX_ATTEMPTS:
+                    delivery.confirmation_locked_until = timezone.now() + timedelta(
+                        minutes=CONFIRMATION_LOCKOUT_MINUTES
+                    )
+                    update_fields.append("confirmation_locked_until")
+                delivery.save(update_fields=update_fields)
+                return Response({"error": "Code invalide"}, status=400)
+
+            now = timezone.now()
+            delivery.status = "delivered"
+            delivery.delivered_at = now
+            delivery.save(update_fields=["status", "delivered_at"])
+
+            # Point d'entrée unique du cycle de vie commande : shipped → delivered. Le
+            # coursier NE clôture PLUS la commande et NE libère PLUS les fonds au vendeur —
+            # seule la confirmation acheteur (escrow.confirm_reception → complete_and_release)
+            # le fait. C'est le correctif du double reversement (BLOQUANT #1) : les deux
+            # chemins ne convergent plus sur release_escrow_funds.
+            OrderLifecycleService.mark_delivered(delivery.order_id, actor=request.user)
+
+        # Paiement du coursier hors transaction (appel réseau NotchPay, fail-soft) — ne
+        # bloque jamais la réponse au coursier. Reste garanti unique par la transition de
+        # statut de la livraison (in_transit → delivered, atomique + verrouillée ci-dessus).
+        pay_courier_for_delivery(delivery)
+
+        return Response(self.get_serializer(delivery).data)
 
     @action(detail=True, methods=["post"], url_path="update-location")
     def update_location(self, request, pk=None):
@@ -159,4 +238,4 @@ class DeliveryViewSet(
                     },
                 },
             )
-        return Response(DeliverySerializer(delivery).data)
+        return Response(self.get_serializer(delivery).data)

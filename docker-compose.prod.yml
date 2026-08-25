@@ -1,27 +1,48 @@
-# Production (VPS) : nginx + certbot devant, gunicorn/uvicorn ASGI, Celery worker/beat/flower.
-# Pour le développement local : docker-compose.yml.
+# Stack PROD (branche main -> https://api.sentaa.net). Projet Compose : sentaa-prod.
+# Le TLS et le routage par domaine sont assurés par la gateway partagée (docker-compose.gateway.yml).
+# Ce stack expose uniquement son nginx interne sur 127.0.0.1:8001 (loopback -> invisible d'internet).
 #
 #   docker compose -f docker-compose.prod.yml up -d
-#   docker compose -f docker-compose.prod.yml logs -f web
+#
+# Isolation réseau : db/redis sur `backend` (internal: true -> pas d'accès internet) ; web/celery
+# sur `frontend` + `backend` (internet requis : NotchPay, Twilio, Cloudinary).
+name: sentaa-prod
 
-x-app-image: &app-image
-  build: .
-  image: sentaaback:latest
-  env_file: .env
-  environment: &app-env
-    POSTGRES_HOST: db
-    POSTGRES_PORT: "5432"
-    POSTGRES_DB: ${POSTGRES_DB:-sentaa}
-    POSTGRES_USER: ${POSTGRES_USER:-sentaa}
-    POSTGRES_PASS: ${POSTGRES_PASSWORD}
-    REDIS_URL: redis://redis:6379/0
-    CELERY_BROKER_URL: redis://redis:6379/2
-    CELERY_RESULT_BACKEND: redis://redis:6379/2
-  restart: unless-stopped
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+  celery_beat_data:
+
+x-app-build: &app-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+# Variables communes à web + celery_* (Django lit POSTGRES_PASS ; le conteneur db lit
+# POSTGRES_PASSWORD -> même valeur, source unique dans .env).
+x-app-env: &app-env
+  POSTGRES_DB: ${POSTGRES_DB:-sentaa}
+  POSTGRES_USER: ${POSTGRES_USER:-sentaa}
+  POSTGRES_PASS: ${POSTGRES_PASSWORD}
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  REDIS_URL: redis://redis:6379/0
 
 services:
+
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [backend]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-sentaa}
       POSTGRES_USER: ${POSTGRES_USER:-sentaa}
@@ -30,107 +51,137 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentaa} -d ${POSTGRES_DB:-sentaa}"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 10
-    restart: unless-stopped
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: '1.0', memory: 512M }
+        reservations: { memory: 256M }
 
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks: [backend]
+    # volatile-lru : n'évince que les clés cache (avec TTL), jamais les messages broker/channel.
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: '0.5', memory: 320M }
+
   web:
-    <<: *app-image
+    <<: *app-build
+    restart: unless-stopped
+    networks: [frontend, backend]
+    env_file: [.env]
     environment:
       <<: *app-env
+      # web est le SEUL à migrer/collectstatic (entrypoint.sh) -> pas de migrate concurrent.
       RUN_MIGRATIONS: "true"
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      ALLOWED_HOSTS: "api.sentaa.net,localhost,127.0.0.1"
+      DEBUG: "False"
     volumes:
       - static_volume:/app/staticfiles
       - media_volume:/app/media
-    expose:
-      - "8000"
-
-  celery_worker:
-    <<: *app-image
-    command: celery -A back_sentaa worker -l info --concurrency=${CELERY_CONCURRENCY:-4} --max-tasks-per-child=200
     depends_on:
-      web:
-        condition: service_healthy
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
     healthcheck:
-      test: ["CMD-SHELL", "celery -A back_sentaa inspect ping || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/categories/"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: '2.0', memory: 1G }
+        reservations: { memory: 512M }
+
+  celery_worker:
+    <<: *app-build
+    restart: unless-stopped
+    networks: [frontend, backend]
+    command: >
+      celery -A back_sentaa worker
+      --loglevel=warning
+      --concurrency=${CELERY_CONCURRENCY:-4}
+      --max-tasks-per-child=200
+    env_file: [.env]
+    environment:
+      <<: *app-env
     volumes:
       - media_volume:/app/media
+    depends_on:
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '1.0', memory: 384M }
+        reservations: { memory: 256M }
 
   celery_beat:
-    <<: *app-image
-    command: celery -A back_sentaa beat -l info --schedule=/tmp/celerybeat-schedule
+    <<: *app-build
+    restart: unless-stopped
+    networks: [backend]
+    command: >
+      celery -A back_sentaa beat
+      --loglevel=warning
+      --schedule=/data/celerybeat-schedule
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    volumes:
+      - celery_beat_data:/data
     depends_on:
-      web:
-        condition: service_healthy
-    healthcheck:
-      disable: true
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.25', memory: 128M }
 
   flower:
-    <<: *app-image
-    command: celery -A back_sentaa flower --port=5555
-    depends_on:
-      web:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5555"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+    <<: *app-build
+    restart: unless-stopped
+    networks: [backend]
+    command: >
+      celery -A back_sentaa flower
+      --port=5555
+      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-changeme}
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    # Accès monitoring via tunnel SSH uniquement : ssh -L 5555:localhost:5555 <user>@<vps>
     ports:
-      # Accès depuis ton poste via : ssh -L 5555:localhost:${FLOWER_PORT:-5555} <user>@<vps>
-      # FLOWER_PORT ajustable dans .env si le port 5555 est déjà pris sur l'hôte.
-      - "127.0.0.1:${FLOWER_PORT:-5555}:5555"
-
-  nginx:
-    image: nginx:alpine
+      - "127.0.0.1:5555:5555"
     depends_on:
-      web:
-        condition: service_healthy
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.25', memory: 128M }
+
+  # Nginx interne prod : sert /static/ + /media/ et proxifie vers web. TLS géré par la gateway.
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    networks: [frontend]
+    ports:
+      - "127.0.0.1:8001:80"
     volumes:
-      - ./deploy/nginx/sentaa.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
       - static_volume:/app/staticfiles:ro
       - media_volume:/app/media:ro
-      - certbot_certs:/etc/letsencrypt:ro
-      - certbot_webroot:/var/www/certbot:ro
-    ports:
-      - "80:80"
-      - "443:443"
-    restart: unless-stopped
-
-  certbot:
-    image: certbot/certbot
-    volumes:
-      - certbot_certs:/etc/letsencrypt
-      - certbot_webroot:/var/www/certbot
-
-    entrypoint: "true"
-
-volumes:
-  postgres_data:
-  redis_data:
-  static_volume:
-  media_volume:
-  certbot_certs:
-  certbot_webroot:
+    depends_on:
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.5', memory: 64M }

@@ -18,7 +18,12 @@ class ConversationViewSet(
     serializer_class = ConversationSerializer
 
     def get_queryset(self):
-        return Conversation.objects.filter(participants=self.request.user).distinct()
+        return (
+            Conversation.objects.filter(participants=self.request.user)
+            .select_related("listing")
+            .prefetch_related("participants")
+            .distinct()
+        )
 
     def get_permissions(self):
         if self.action in ("retrieve", "messages"):

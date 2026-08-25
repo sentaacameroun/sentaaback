@@ -155,13 +155,20 @@ poetry.lock
 mp3_files/
 
 staticfiles/
-
-ekila_streams/local_settings.py
+.**
 
 static/local_img/
 static_files/django_extensions/
 static_files/admin/
 static_files/summernote/
 .env
+
+# Le glob « .** » (plus haut) masque tout chemin commençant par un point, y compris les
+# workflows GitHub Actions. On les ré-inclut explicitement, sinon .github/workflows/deploy.yml
+# ne serait jamais versionné ni exécuté par GitHub.
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+landing/
 
 **/*Zone.Identifier

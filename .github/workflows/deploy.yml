@@ -1,0 +1,159 @@
+# CI/CD Sentaa — un seul VPS, staging et prod isolés (inspiré du pattern mytutor).
+#
+#   push branche `dev`  -> tests -> deploy STAGING -> https://dev.sentaa.net
+#   push branche `main` -> tests -> deploy PROD    -> https://api.sentaa.net
+#   pull_request        -> tests uniquement (aucun déploiement)
+#
+# Le déploiement se fait EN SSH sur le VPS : git reset --hard sur la bonne branche, puis
+# `docker compose build` + `up -d`. L'image est construite SUR LE VPS (pas de registry).
+# Le nginx interne de chaque stack est publié sur la loopback (prod 8001 / staging 8002) ;
+# la gateway partagée (docker-compose.gateway.yml, TLS) route api/dev.sentaa.net vers eux.
+#
+# Prérequis VPS (voir deploy/README.md) :
+#   - checkout du repo dans /var/www/sentaa-backend (prod) et /var/www/sentaa-backend-dev (staging),
+#     avec un remote git accessible (clé de déploiement) et un fichier .env par dossier ;
+#   - gateway + certificat initialisés une fois via scripts/setup-ssl.sh.
+#
+# Secrets (par environnement GitHub `staging` / `prod`) :
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_PORT
+
+name: CI/CD
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests & lint
+    # Gate bloquant : s'exécute sur push (main/dev) ET sur pull_request. Les jobs de déploiement
+    # en dépendent, donc AUCUN déploiement ne part si pytest ou ruff échoue.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: sentaa_test
+          POSTGRES_USER: sentaa
+          POSTGRES_PASSWORD: sentaa
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sentaa -d sentaa_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Valeurs factices : la suite ne contacte aucun service externe réel.
+      SECRET_KEY: ci-secret-not-used-in-prod-please-ignore-0123456789
+      # DEBUG reste False (proche de la prod) ; conftest.py neutralise SECURE_SSL_REDIRECT
+      # pendant les tests, sinon SecurityMiddleware renverrait 301 sur le client HTTP.
+      DEBUG: "False"
+      POSTGRES_DB: sentaa_test
+      POSTGRES_USER: sentaa
+      POSTGRES_PASS: sentaa
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://127.0.0.1:6379/0
+      SMS_BACKEND: console
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tests (pytest)
+        run: pytest
+
+  # ── STAGING (branche dev -> /var/www/sentaa-backend-dev) ─────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: true
+    steps:
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+            cd /var/www/sentaa-backend-dev
+
+            git fetch origin
+            git reset --hard origin/dev
+
+            # web (RUN_MIGRATIONS=true) joue migrate + collectstatic via entrypoint.sh au démarrage.
+            docker compose -f docker-compose.staging.yml build
+            docker compose -f docker-compose.staging.yml up -d --remove-orphans
+
+            docker image prune -f
+            echo "staging deployed — $(git rev-parse --short HEAD)"
+
+  # ── PROD (branche main -> /var/www/sentaa-backend) ───────────────────────────
+  deploy-prod:
+    name: Deploy → Prod
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    steps:
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+            cd /var/www/sentaa-backend
+
+            git fetch origin
+            git reset --hard origin/main
+
+            docker compose -f docker-compose.prod.yml build
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            docker image prune -f
+
+            # Vérifie que web est bien healthy après le déploiement.
+            sleep 10
+            docker compose -f docker-compose.prod.yml ps web | grep -q "healthy\|Up" \
+              || (echo "web container not healthy" && docker compose -f docker-compose.prod.yml logs --tail=50 web && exit 1)
+
+            echo "prod deployed — $(git rev-parse --short HEAD)"

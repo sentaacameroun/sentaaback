@@ -15,6 +15,10 @@ class Order(models.Model):
         ("pending", "En attente de paiement"),
         ("paid_escrow", "Payé (Fonds bloqués)"),
         ("shipped", "Expédié"),
+        # Étape intermédiaire (PR 3) : le coursier a livré (code saisi), mais les fonds
+        # ne sont pas encore libérés. Seule la confirmation acheteur (complete_and_release)
+        # fait passer delivered → completed. Voir escrow/services/order_lifecycle.py.
+        ("delivered", "Livré (En attente confirmation acheteur)"),
         ("received", "Reçu (Validation acheteur)"),
         ("completed", "Terminé (Fonds libérés)"),
         ("disputed", "En litige"),
@@ -76,30 +80,56 @@ class Order(models.Model):
 
 class PaymentTransaction(models.Model):
     """
-    Trace brute des échanges avec l'API NotchPay (MTN MoMo / Orange Money).
+    Trace brute des échanges avec les fournisseurs de paiement Mobile Money (NotchPay, KPay,
+    MoneyFusion — voir escrow/services/providers/, chaîne de fallback avec résilience
+    automatique en cas d'indisponibilité d'un fournisseur).
     """
 
     TRANSACTION_TYPES = (
         ("collect", "Collecte (paiement acheteur)"),
         ("withdraw", "Reversement (paiement vendeur)"),
+        ("courier_payout", "Reversement (paiement livreur)"),
     )
     STATUS_CHOICES = (
         ("pending", "En attente"),
         ("successful", "Réussi"),
         ("failed", "Échoué"),
     )
-    CHANNELS = (("cm.mtn", "MTN MoMo"), ("cm.orange", "Orange Money"))
+    # Canal abstrait, indépendant du fournisseur ayant traité la transaction — chaque
+    # fournisseur traduit vers son propre code (voir escrow/services/providers/*.py).
+    CHANNELS = (("mtn", "MTN MoMo"), ("orange", "Orange Money"))
+    PROVIDERS = (
+        ("notchpay", "NotchPay"),
+        ("kpay", "KPay"),
+        ("moneyfusion", "MoneyFusion"),
+    )
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # PROTECT : le journal financier ne doit jamais être supprimé par cascade quand une
+    # Order est supprimée. Toute tentative de suppression d'une commande ayant des
+    # transactions lève une IntegrityError au niveau base (voir escrow/tests.py).
     order = models.ForeignKey(
-        Order, on_delete=models.CASCADE, related_name="transactions"
+        Order, on_delete=models.PROTECT, related_name="transactions"
     )
     transaction_type = models.CharField(
-        max_length=10, choices=TRANSACTION_TYPES, default="collect"
+        max_length=20, choices=TRANSACTION_TYPES, default="collect"
     )
-    external_ref = models.CharField(
-        max_length=100, unique=True, null=True, blank=True
-    )  # Référence NotchPay
+    # Référence interne générée par Senta'a (idempotence), propagée tel quel au fournisseur
+    # retenu par le router — stable quel que soit le fournisseur ayant effectivement traité
+    # l'opération.
+    external_ref = models.CharField(max_length=100, unique=True, null=True, blank=True)
+    # Clé d'idempotence applicative : garantit qu'une même opération (collecte, reversement)
+    # ne peut produire qu'une seule ligne, via une contrainte unique en base plutôt qu'une
+    # simple garde applicative. Nullable en transition (lignes créées avant l'ajout du champ).
+    idempotency_key = models.CharField(
+        max_length=255, unique=True, null=True, blank=True
+    )
+    # Fournisseur ayant effectivement traité la transaction, et sa propre référence (son id/
+    # token) — distincte de `external_ref`, utile pour la traçabilité/réconciliation avec le
+    # tableau de bord du fournisseur. `blank=True` pour compatibilité avec les lignes créées
+    # avant l'ajout de ce champ.
+    provider = models.CharField(max_length=20, choices=PROVIDERS, blank=True)
+    provider_reference = models.CharField(max_length=150, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     channel = models.CharField(max_length=10, choices=CHANNELS)
     phone_number = models.CharField(max_length=20, blank=True)
@@ -109,6 +139,11 @@ class PaymentTransaction(models.Model):
     )
     is_success = models.BooleanField(default=False)
     raw_response = models.JSONField(null=True, blank=True)  # Pour le debug/audit
+
+    # Nombre de passages de la tâche de réconciliation (escrow/tasks.py) sur ce reversement
+    # resté `pending`. Borne le nombre de re-vérifications (pas de retry infini silencieux) :
+    # au-delà du seuil, la ligne est sortie de la file et loggée pour intervention manuelle.
+    reconciliation_attempts = models.PositiveSmallIntegerField(default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
 

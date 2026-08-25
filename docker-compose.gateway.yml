@@ -1,0 +1,26 @@
+# Gateway nginx PARTAGÉE (staging + prod). Seul service qui écoute sur 80/443 du VPS.
+# Démarrée UNE FOIS par scripts/setup-ssl.sh (qui émet aussi le certificat SAN), puis rechargée
+# automatiquement au renouvellement (scripts/renew-ssl.sh, cron).
+#
+#   docker compose -f docker-compose.gateway.yml up -d
+#
+# `network_mode: host` : la gateway tourne sur la pile réseau de l'hôte. Elle atteint donc
+# directement le nginx interne de chaque stack via la loopback (127.0.0.1:8001 prod,
+# 127.0.0.1:8002 staging) — ces ports ne sont pas exposés à internet — et sert le challenge
+# ACME + les certificats depuis les répertoires certbot montés depuis l'hôte.
+name: sentaa-gateway
+
+services:
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 64M

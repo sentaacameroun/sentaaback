@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 def create_delivery_for_order(order):
-    """Auto-crée une Delivery non assignée dès que l'order passe en paid_escrow."""
     seller = order.listing.seller
     delivery, created = Delivery.objects.get_or_create(
         order=order,
@@ -73,12 +72,16 @@ def notify_nearby_couriers(delivery, radius_km=5, limit=5):
                     "id": str(delivery.id),
                     "pickup_latitude": str(delivery.pickup_latitude),
                     "pickup_longitude": str(delivery.pickup_longitude),
-                    "destination_latitude": str(delivery.destination_latitude)
-                    if delivery.destination_latitude
-                    else None,
-                    "destination_longitude": str(delivery.destination_longitude)
-                    if delivery.destination_longitude
-                    else None,
+                    "destination_latitude": (
+                        str(delivery.destination_latitude)
+                        if delivery.destination_latitude
+                        else None
+                    ),
+                    "destination_longitude": (
+                        str(delivery.destination_longitude)
+                        if delivery.destination_longitude
+                        else None
+                    ),
                 },
             },
         )

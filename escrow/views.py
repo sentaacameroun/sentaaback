@@ -1,8 +1,12 @@
+import hashlib
+import hmac
 import logging
 
+from django.conf import settings
 from django.db import models
 from django.db import transaction
 from django.utils import timezone
+from rest_framework import mixins
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
@@ -16,11 +20,23 @@ from escrow.serializers import OrderSerializer
 from escrow.services.delivery_hooks import on_order_paid
 from escrow.services.notchpay_client import NotchPayClient
 from escrow.services.notchpay_client import NotchPayError
+from escrow.services.order_lifecycle import OrderLifecycleError
+from escrow.services.order_lifecycle import OrderLifecycleService
 
 logger = logging.getLogger(__name__)
 
 
-class OrderViewSet(viewsets.ModelViewSet):
+class OrderViewSet(
+    mixins.CreateModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.ListModelMixin,
+    viewsets.GenericViewSet,
+):
+    # Mixins explicites plutôt que `ModelViewSet` : le verbe DELETE ne doit jamais être
+    # exposé sur une commande. Le journal financier (PaymentTransaction) a une FK vers
+    # Order et ne doit jamais pouvoir être supprimé, même par cascade (voir .claude/rules/
+    # escrow-core.md). Aucun `DestroyModelMixin` ici → DELETE renvoie 405.
     queryset = Order.objects.all()
     serializer_class = OrderSerializer
 
@@ -32,7 +48,6 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def initiate_payment(self, request, pk=None):
-        """L'acheteur déclenche la collecte Mobile Money vers l'escrow."""
         order = self.get_object()
         if order.buyer != request.user:
             return Response({"error": "Action interdite"}, status=403)
@@ -82,83 +97,57 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def confirm_reception(self, request, pk=None):
-        """L'acheteur confirme avoir reçu l'objet : libération des fonds vers le vendeur."""
+        # Permission objet : seul l'acheteur de CETTE commande peut confirmer la réception
+        # (IsAuthenticated seul ne suffit pas — voir .claude/rules, règle #4).
         order = self.get_object()
         if order.buyer != request.user:
             return Response({"error": "Action interdite"}, status=403)
 
-        if order.status != "shipped":
-            return Response(
-                {"error": "La commande n'est pas en cours d'expédition"}, status=400
-            )
-
-        order.status = "completed"
-        order.save(update_fields=["status"])
-
-        payout_amount = order.item_price - order.service_fee
-        seller = order.listing.seller
-        last_collect = (
-            order.transactions.filter(transaction_type="collect", status="successful")
-            .order_by("-created_at")
-            .first()
-        )
-        channel = (
-            last_collect.channel if last_collect else PaymentTransaction.CHANNELS[0][0]
-        )
-        phone_number = (
-            last_collect.phone_number if last_collect else str(seller.phone_number)
-        )
-
-        client = NotchPayClient()
+        # Clôture déléguée au point d'entrée unique du cycle de vie : delivered → completed
+        # + libération idempotente des fonds au vendeur. Aucune écriture de statut terminal
+        # ni de payout ici (plus de logique de clôture dupliquée dans la vue).
         try:
-            result = client.initialize_transfer(
-                amount=payout_amount,
-                account_number=str(seller.phone_number),
-                channel=channel,
-                currency="XAF",
-                description=f"Reversement vendeur commande {order.id}",
+            OrderLifecycleService.complete_and_release(order.id, actor=request.user)
+        except OrderLifecycleError:
+            return Response(
+                {"error": "La commande n'a pas encore été livrée"}, status=400
             )
-            transfer_ref = None
-            if isinstance(result, dict):
-                transfer_ref = (result.get("transaction") or {}).get("reference")
-            PaymentTransaction.objects.create(
-                order=order,
-                transaction_type="withdraw",
-                external_ref=transfer_ref,
-                amount=payout_amount,
-                channel=channel,
-                phone_number=phone_number,
-                status="pending",
-                raw_response=result,
-            )
-        except NotchPayError:
-            # Le buyer a bien confirmé réception, on ne fait pas échouer sa requête :
-            # le payout raté est tracé pour réconciliation manuelle par un admin.
-            logger.exception(
-                "Échec du reversement vendeur pour order %s ; réconciliation manuelle nécessaire",
-                order.id,
-            )
-            PaymentTransaction.objects.create(
-                order=order,
-                transaction_type="withdraw",
-                amount=payout_amount,
-                channel=channel,
-                phone_number=phone_number,
-                status="failed",
-                raw_response={"error": "payout_call_failed"},
-            )
-
-        order.payout_at = timezone.now()
-        order.save(update_fields=["payout_at"])
         return Response({"status": "Fonds libérés au vendeur"})
 
 
 class MobileMoneyWebhookView(APIView):
-    """Endpoint public pour recevoir les confirmations NotchPay (collecte/reversement)."""
-
     permission_classes = [AllowAny]
 
+    @staticmethod
+    def _signature_ok(request):
+        """
+        Vérifie la signature NotchPay (MAJEUR #8 de l'audit). NotchPay signe le corps brut de
+        la requête en HMAC-SHA256 avec le « webhook hash » configuré côté fournisseur, et la
+        transmet dans l'en-tête `x-notch-signature`.
+
+        - Si `NOTCHPAY_WEBHOOK_HASH` est configuré : la signature est exigée et vérifiée avant
+          tout traitement ; une requête non signée ou mal signée est rejetée.
+        - Si aucun secret n'est configuré (dev/tests, ou instance sans hash webhook) : on
+          retombe sur la mitigation déjà en place — la re-vérification du statut via l'API
+          NotchPay (`verify_payment`), qui rend un succès impossible à forger. Voir
+          REFACTOR_PLAN.md (PR 5) pour ce choix.
+        """
+        secret = getattr(settings, "NOTCHPAY_WEBHOOK_HASH", "")
+        if not secret:
+            return True
+        received = request.headers.get("x-notch-signature", "")
+        if not received:
+            return False
+        expected = hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(received, expected)
+
     def post(self, request):
+        # Signature vérifiée AVANT toute lecture de `request.data` / appel réseau : une requête
+        # non signée ne doit déclencher aucun traitement (ni appel sortant NotchPay).
+        if not self._signature_ok(request):
+            logger.warning("Webhook NotchPay rejeté : signature absente ou invalide")
+            return Response(status=401)
+
         reference = request.data.get("reference") or request.data.get(
             "external_reference"
         )
@@ -173,8 +162,6 @@ class MobileMoneyWebhookView(APIView):
                     .first()
                 )
                 if txn is None:
-                    # Référence inconnue de notre côté : on acquitte quand même
-                    # pour éviter que NotchPay ne retente indéfiniment.
                     return Response(status=200)
 
                 if txn.status != "pending":

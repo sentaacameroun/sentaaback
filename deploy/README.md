@@ -1,110 +1,124 @@
-# Docker : développement local vs production (VPS)
+# Déploiement Sentaa — VPS unique, staging + prod isolés
 
-Deux fichiers compose totalement séparés, pas de merge d'override entre eux :
+Architecture volontairement simple, 3 briques indépendantes (aucun registry, aucun réseau
+Docker partagé entre stacks) :
 
-- **`docker-compose.yml`** — développement local. Pas de nginx/TLS, code monté en bind (édition
-  sans rebuild), `runserver` (HTTP + WebSockets via Channels), ports Postgres/Redis exposés
-  directement pour inspection (psql, client GUI).
-- **`docker-compose.prod.yml`** — production VPS. `nginx` (reverse-proxy + TLS) devant `web`
-  (Django ASGI, gunicorn+uvicorn) + `celery_worker` + `celery_beat` + `flower` (monitoring,
-  loopback uniquement) → `db` (Postgres) + `redis` (cache, channel layer Channels, broker Celery).
+```
+                      ┌──────────────────────────────────────────┐
+   Internet 443 ─────▶│  Gateway nginx (docker-compose.gateway)  │  TLS (Let's Encrypt)
+                      │  network_mode: host                       │
+                      └───────────┬──────────────────┬───────────┘
+                     api.sentaa.net           dev.sentaa.net
+                          │ 127.0.0.1:8001          │ 127.0.0.1:8002
+              ┌───────────▼──────────┐   ┌──────────▼───────────┐
+              │  Stack PROD          │   │  Stack STAGING       │
+              │  docker-compose.prod │   │  docker-compose.stag.│
+              │  nginx→web→celery… db │   │  nginx→web→celery… db │
+              │  projet: sentaa-prod │   │  projet:sentaa-staging│
+              └──────────────────────┘   └──────────────────────┘
+```
 
-Les deux partagent le même `Dockerfile`/`entrypoint.sh` : seul le conteneur `web` exécute
-`migrate`/`collectstatic`/`createsuperuser` (variable `RUN_MIGRATIONS=true`), les autres attendent
-son statut `healthy` avant de démarrer — évite que 4 conteneurs partageant la même image ne se
-marchent dessus en essayant de migrer simultanément.
+1. **Gateway** (`docker-compose.gateway.yml`) — seul service sur `80/443`, termine le TLS,
+   route chaque domaine vers le nginx interne du stack via la loopback. Tourne en
+   `network_mode: host`. Config : `nginx/nginx.conf`.
+2. **Stacks applicatifs** (`docker-compose.prod.yml` / `docker-compose.staging.yml`) — chacun
+   complet et isolé (projet/volumes/réseaux séparés) : `db` + `redis` + `web` (Django ASGI) +
+   `celery_worker` + `celery_beat` + `flower` + `nginx` interne. Le nginx interne sert
+   `/static/` + `/media/` et proxifie le reste (WebSockets `/ws/` inclus). Configs :
+   `nginx/nginx.prod.conf`, `nginx/nginx.staging.conf`.
+3. **TLS** (`scripts/setup-ssl.sh` / `scripts/renew-ssl.sh`) — certbot sur l'hôte, 1 certificat
+   SAN pour les deux domaines, renouvellement par cron.
 
-## Développement local
+Le CI/CD (`.github/workflows/deploy.yml`) build **sur le VPS** : `git reset --hard` puis
+`docker compose build && up -d`. `dev` → staging, `main` → prod.
+
+---
+
+## Mise en place initiale du VPS (une seule fois)
+
+Prérequis : Docker + Docker Compose v2, utilisateur non-root dans le groupe `docker`,
+DNS `api.sentaa.net` **et** `dev.sentaa.net` pointant vers l'IP du VPS.
+
+### 1. Cloner le repo dans les deux dossiers
 
 ```bash
-cp .env.example .env   # SECRET_KEY suffit pour commencer, le reste a des défauts dev-safe
-docker compose up -d
-docker compose logs -f web
+sudo mkdir -p /var/www/sentaa-backend /var/www/sentaa-backend-dev
+sudo chown "$USER" /var/www/sentaa-backend /var/www/sentaa-backend-dev
+
+git clone <url-repo> /var/www/sentaa-backend        # prod
+git -C /var/www/sentaa-backend checkout main
+
+git clone <url-repo> /var/www/sentaa-backend-dev    # staging
+git -C /var/www/sentaa-backend-dev checkout dev
 ```
 
-L'app est sur `http://localhost:8000/api/...`, Flower sur `http://localhost:5555`, Postgres sur
-`localhost:5432`, Redis sur `localhost:6379`. Le code est bind-monté (`.:/app`) : toute modif est
-prise en compte immédiatement par `runserver`, pas besoin de rebuild sauf changement de
-`requirements.txt`/`Dockerfile`.
+> Le VPS doit pouvoir `git fetch` sans interaction (clé de déploiement / HTTPS avec token).
+
+### 2. Fichier `.env` par environnement
 
 ```bash
-docker compose exec web python manage.py createsuperuser
-docker compose down          # -v pour aussi supprimer les données Postgres
+cp /var/www/sentaa-backend/.env.example     /var/www/sentaa-backend/.env
+cp /var/www/sentaa-backend-dev/.env.example /var/www/sentaa-backend-dev/.env
 ```
 
-## Production (VPS)
+Éditer chaque `.env` : au minimum `SECRET_KEY`, `POSTGRES_PASSWORD`, `FLOWER_PASSWORD`, et les
+clés externes voulues (`NOTCHPAY_*`, `TWILIO_*`, `CLOUDINARY_*`). `ALLOWED_HOSTS` est fixé par
+le compose (pas besoin de le mettre). Ces `.env` ne sont **jamais** commités.
 
-### 1. Premier lancement (HTTP, sans domaine)
+### 3. TLS + gateway (une seule fois)
 
 ```bash
-cp .env.example .env
-# Éditer .env : SECRET_KEY, POSTGRES_PASSWORD, et au minimum NOTCHPAY_*/TWILIO_* si tu veux
-# tester ces flux (sinon ils restent inertes/mockables). Optionnel : DJANGO_SUPERUSER_PHONE_NUMBER
-# + DJANGO_SUPERUSER_PASSWORD (+ _FIRST_NAME/_LAST_NAME) pour créer un superuser automatiquement
-# au premier démarrage (entrypoint.sh, idempotent).
-
-docker compose -f docker-compose.prod.yml up -d
-docker compose -f docker-compose.prod.yml logs -f web   # confirme migrate/collectstatic OK
+cd /var/www/sentaa-backend
+CERTBOT_EMAIL=contact@sentaa.net ./scripts/setup-ssl.sh
 ```
 
-À ce stade, `deploy/nginx/sentaa.conf` sert l'app en HTTP simple sur le port 80 — suffisant pour
-tester depuis l'IP du VPS (`http://<ip-vps>/api/...`), sans certificat.
+Émet le certificat SAN (api + dev), démarre la gateway, installe le cron de renouvellement.
 
-### 2. Passer en HTTPS une fois un nom de domaine pointé vers le VPS
-
-1. Pointer le DNS (A record) du domaine vers l'IP du VPS.
-2. Renseigner `DOMAIN_NAME=ton-domaine.com` dans `.env`.
-3. Émettre le premier certificat (le bloc `/.well-known/acme-challenge/` de la config bootstrap
-   suffit pour la validation webroot) :
-
-   ```bash
-   docker compose -f docker-compose.prod.yml run --rm certbot certonly --webroot \
-     -w /var/www/certbot -d ton-domaine.com \
-     --email toi@example.com --agree-tos --no-eff-email
-   ```
-
-4. Activer la config HTTPS :
-
-   ```bash
-   sed "s/DOMAIN_NAME_PLACEHOLDER/ton-domaine.com/g" \
-     deploy/nginx/sentaa-ssl.conf.example > deploy/nginx/sentaa.conf
-   docker compose -f docker-compose.prod.yml exec nginx nginx -s reload
-   ```
-
-5. Passer `DEBUG=False` (si pas déjà fait) et `ALLOWED_HOSTS`/`CORS_ALLOWED_ORIGINS` sur le vrai
-   domaine dans `.env`, puis `docker compose -f docker-compose.prod.yml up -d` pour relancer `web`
-   avec la nouvelle config.
-
-### 3. Renouvellement du certificat (cron sur l'hôte, pas dans le compose)
-
-Ajouter à la crontab de l'hôte (`crontab -e`) :
-
-```
-0 3 * * * cd /chemin/vers/sentaaback && docker compose -f docker-compose.prod.yml run --rm certbot renew --quiet && docker compose -f docker-compose.prod.yml exec nginx nginx -s reload
-```
-
-### 4. Monitoring des tâches Celery (Flower)
-
-Flower n'est jamais exposé publiquement (`127.0.0.1:5555` uniquement, même règle en dev/prod).
-Depuis ton poste, en prod :
+### 4. Premier démarrage des stacks
 
 ```bash
-ssh -L 5555:localhost:5555 <user>@<vps>
-# puis ouvrir http://localhost:5555 en local
+cd /var/www/sentaa-backend     && docker compose -f docker-compose.prod.yml    up -d --build
+cd /var/www/sentaa-backend-dev && docker compose -f docker-compose.staging.yml up -d --build
 ```
 
-### 5. Prérequis avant test/prod (comptes externes, hors code)
+`web` joue automatiquement `migrate` + `collectstatic` (via `entrypoint.sh`, `RUN_MIGRATIONS=true`).
 
-- **NotchPay** : compte marchand (sandbox pour tester, puis prod) → `NOTCHPAY_PUBLIC_KEY`/`NOTCHPAY_PRIVATE_KEY`.
-- **Twilio** : compte + numéro expéditeur validé pour le Cameroun → `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`/`TWILIO_FROM_NUMBER`, `SMS_BACKEND=twilio`.
-- **Email SMTP** : un compte SMTP (Gmail, Mailgun, ton propre serveur...) → `EMAIL_HOST`/`EMAIL_PORT`/`EMAIL_HOST_USER`/`EMAIL_HOST_PASSWORD`. Sans ça, les emails restent en mode "console" (juste loggés, jamais envoyés).
-- **Nom de domaine** pointé vers l'IP du VPS, pour le TLS.
-- **AWS S3 (optionnel sur VPS)** : contrairement à Render, le disque du VPS est persistant — `media/` survit aux redéploiements sans S3. S3 ne devient utile que si tu veux un CDN ou scaler horizontalement sur plusieurs VPS plus tard.
+### 5. Secrets GitHub (Settings → Environments : `staging` et `prod`)
 
-### 6. Réglages de perf déjà en place
+| Secret         | Description                                  |
+|----------------|----------------------------------------------|
+| `VPS_HOST`     | IP / hostname du VPS                         |
+| `VPS_USER`     | utilisateur SSH (groupe `docker`)            |
+| `VPS_SSH_KEY`  | clé privée SSH autorisée sur le VPS          |
+| `VPS_PORT`     | port SSH (souvent `22`)                      |
 
-- `GUNICORN_WORKERS` (`.env`, défaut 3) — ajuste selon les vCPU du VPS (`(2 × vCPU) + 1` est un bon point de départ).
-- `--max-requests`/`--max-requests-jitter` sur gunicorn et `--max-tasks-per-child` sur Celery : recyclage périodique des workers, évite les fuites mémoire en tourne longue.
-- `CELERY_CONCURRENCY` (`.env`, défaut 4) — nombre de tâches Celery traitées en parallèle.
-- nginx sert `/static/`/`/media/` directement (pas de passage par Python/whitenoise) et gère la compression gzip.
-- Redis sert 3 rôles (cache, channel layer, broker Celery) sur des DB logiques séparées (`/0`, `/2`) — suffisant à cette échelle, pas besoin d'instances séparées.
+Ensuite, tout push sur `dev`/`main` déclenche tests → build sur le VPS → `up -d`.
+
+---
+
+## Opérations courantes
+
+```bash
+# Logs
+docker compose -f docker-compose.prod.yml logs -f web
+
+# Superuser (ou via DJANGO_SUPERUSER_* dans .env au premier démarrage)
+docker compose -f docker-compose.prod.yml exec web python manage.py createsuperuser
+
+# Monitoring Celery (Flower) — tunnel SSH (prod 5555, staging 5556)
+ssh -L 5555:localhost:5555 <user>@<vps>   # puis http://localhost:5555
+
+# Renouvellement TLS manuel (sinon cron)
+./scripts/renew-ssl.sh
+```
+
+## Notes
+
+- **Ports internes** `127.0.0.1:8001` (prod) / `127.0.0.1:8002` (staging) : loopback uniquement,
+  invisibles d'internet ; seule la gateway (sur le réseau hôte) les atteint.
+- **Réseau `backend` `internal: true`** : `db`/`redis` n'ont aucun accès internet.
+- **Média** : servis par le nginx interne depuis le volume `media_volume`. Si Cloudinary/S3 est
+  configuré, les fichiers passent par ces services et `/media/` local reste inutilisé (inoffensif).
+- **CSRF admin** : si tu utilises l'admin Django derrière HTTPS, pense à ajouter
+  `CSRF_TRUSTED_ORIGINS=https://api.sentaa.net,https://dev.sentaa.net` (settings) — non bloquant
+  pour l'API JWT.

@@ -3,7 +3,6 @@ import logging
 from django.conf import settings
 from twilio.base.exceptions import TwilioRestException
 
-
 logger = logging.getLogger(__name__)
 
 

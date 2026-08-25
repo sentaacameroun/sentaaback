@@ -1,6 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 
+from common.images.admin import image_preview_html
 from users.models import User
 
 
@@ -30,7 +31,7 @@ class CustomUserAdmin(UserAdmin):
     )
 
     search_fields = ("phone_number", "first_name", "last_name", "email")
-    readonly_fields = ("date_joined", "last_login")
+    readonly_fields = ("date_joined", "last_login", "courier_id_document_preview")
     fieldsets = (
         (None, {"fields": ("phone_number", "password")}),
         (
@@ -45,6 +46,7 @@ class CustomUserAdmin(UserAdmin):
                     "is_recruiter",
                     "is_courier",
                     "courier_application_status",
+                    "courier_id_document_preview",
                     "is_active",
                     "is_staff",
                     "is_superuser",
@@ -53,6 +55,10 @@ class CustomUserAdmin(UserAdmin):
         ),
         ("Dates importantes", {"fields": ("last_login", "date_joined")}),
     )
+
+    @admin.display(description="Pièce d'identité coursier")
+    def courier_id_document_preview(self, obj):
+        return image_preview_html(obj.courier_id_document, signed=True, height=200)
 
     ordering = ("-date_joined",)
     actions = ["approve_courier_applications", "reject_courier_applications"]

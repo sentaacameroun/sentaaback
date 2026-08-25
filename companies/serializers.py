@@ -1,9 +1,14 @@
 from rest_framework import serializers
 
+from common.images.fields import CloudinaryImageField
 from companies.models import CompanyProfile
 
 
 class CompanyProfileSerializer(serializers.ModelSerializer):
+    logo = CloudinaryImageField(
+        required=False, allow_null=True, variant="card", max_bytes=2 * 1024 * 1024
+    )
+
     class Meta:
         model = CompanyProfile
         fields = [
@@ -22,6 +27,7 @@ class CompanyProfileSerializer(serializers.ModelSerializer):
 
 
 class CompanyProfilePublicSerializer(serializers.ModelSerializer):
+    logo = CloudinaryImageField(read_only=True, variant="card")
     listings = serializers.SerializerMethodField()
     job_offers = serializers.SerializerMethodField()
 

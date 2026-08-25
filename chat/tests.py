@@ -1,3 +1,4 @@
+from channels.db import database_sync_to_async
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
 from django.test import TransactionTestCase
@@ -103,11 +104,13 @@ class ChatWebsocketTests(TransactionTestCase):
         )
         return JWTAuthMiddleware(router)
 
-    def _token(self, user):
+    # Convertit la génération de token en fonction asynchrone compatible ORM
+    @database_sync_to_async
+    def _get_token_async(self, user):
         return str(RefreshToken.for_user(user).access_token)
 
     async def test_participant_can_connect_and_exchange_messages(self):
-        token = self._token(self.buyer)
+        token = await self._get_token_async(self.buyer)
         communicator = WebsocketCommunicator(
             self._app(), f"/ws/chat/{self.conversation.id}/?token={token}"
         )
@@ -128,7 +131,8 @@ class ChatWebsocketTests(TransactionTestCase):
         self.assertFalse(connected)
 
     async def test_connection_rejected_for_non_participant(self):
-        token = self._token(self.stranger)
+        # Ajout du 'await' pour appeler la méthode asynchrone
+        token = await self._get_token_async(self.stranger)
         communicator = WebsocketCommunicator(
             self._app(), f"/ws/chat/{self.conversation.id}/?token={token}"
         )

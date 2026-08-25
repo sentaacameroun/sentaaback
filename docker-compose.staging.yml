@@ -1,0 +1,175 @@
+# Stack STAGING (branche dev -> https://dev.sentaa.net). Projet Compose : sentaa-staging.
+# Identique au stack prod (docker-compose.prod.yml) mais isolé : projet/volumes/réseaux séparés,
+# nginx interne sur 127.0.0.1:8002, flower sur 127.0.0.1:5556, limites de ressources réduites.
+#
+#   docker compose -f docker-compose.staging.yml up -d
+name: sentaa-staging
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+  celery_beat_data:
+
+x-app-build: &app-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-app-env: &app-env
+  POSTGRES_DB: ${POSTGRES_DB:-sentaa}
+  POSTGRES_USER: ${POSTGRES_USER:-sentaa}
+  POSTGRES_PASS: ${POSTGRES_PASSWORD}
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  REDIS_URL: redis://redis:6379/0
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sentaa}
+      POSTGRES_USER: ${POSTGRES_USER:-sentaa}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentaa} -d ${POSTGRES_DB:-sentaa}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: '0.5', memory: 256M }
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [backend]
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 128mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: '0.25', memory: 160M }
+
+  web:
+    <<: *app-build
+    restart: unless-stopped
+    networks: [frontend, backend]
+    env_file: [.env]
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: "true"
+      ALLOWED_HOSTS: "dev.sentaa.net,localhost,127.0.0.1"
+      DEBUG: "False"
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/categories/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: '1.0', memory: 512M }
+
+  celery_worker:
+    <<: *app-build
+    restart: unless-stopped
+    networks: [frontend, backend]
+    command: >
+      celery -A back_sentaa worker
+      --loglevel=warning
+      --concurrency=${CELERY_CONCURRENCY:-2}
+      --max-tasks-per-child=200
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    volumes:
+      - media_volume:/app/media
+    depends_on:
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.5', memory: 256M }
+
+  celery_beat:
+    <<: *app-build
+    restart: unless-stopped
+    networks: [backend]
+    command: >
+      celery -A back_sentaa beat
+      --loglevel=warning
+      --schedule=/data/celerybeat-schedule
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    volumes:
+      - celery_beat_data:/data
+    depends_on:
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.1', memory: 96M }
+
+  flower:
+    <<: *app-build
+    restart: unless-stopped
+    networks: [backend]
+    command: >
+      celery -A back_sentaa flower
+      --port=5555
+      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-changeme}
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    ports:
+      - "127.0.0.1:5556:5555"
+    depends_on:
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.1', memory: 96M }
+
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    networks: [frontend]
+    ports:
+      - "127.0.0.1:8002:80"
+    volumes:
+      - ./nginx/nginx.staging.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/app/staticfiles:ro
+      - media_volume:/app/media:ro
+    depends_on:
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: '0.25', memory: 64M }

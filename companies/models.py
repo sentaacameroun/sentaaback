@@ -1,15 +1,17 @@
 import uuid
 
+from cloudinary.models import CloudinaryField
 from django.conf import settings
 from django.db import models
 
+from common.images.validators import ImageFileValidator
+
+
+def company_logo_public_id(instance):
+    return f"{settings.CLOUDINARY_FOLDER_PREFIX}/companies/logos/{instance.id}"
+
 
 class CompanyProfile(models.Model):
-    """
-    Profil entreprise optionnel et additif : n'importe quel compte peut s'en créer un
-    pour vendre/recruter sous une bannière pro, sans que ça remplace le compte personnel.
-    """
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     owner = models.OneToOneField(
         settings.AUTH_USER_MODEL,
@@ -18,7 +20,19 @@ class CompanyProfile(models.Model):
     )
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True)
-    logo = models.ImageField(upload_to="companies/", null=True, blank=True)
+    logo = CloudinaryField(
+        resource_type="image",
+        type="upload",
+        public_id=company_logo_public_id,
+        overwrite=True,
+        invalidate=True,
+        unique_filename=False,
+        use_filename=False,
+        allowed_formats=["jpg", "jpeg", "png", "webp"],
+        validators=[ImageFileValidator(max_bytes=2 * 1024 * 1024)],
+        null=True,
+        blank=True,
+    )
     sector = models.CharField(max_length=100, blank=True)
     website = models.URLField(blank=True)
     rccm_number = models.CharField(

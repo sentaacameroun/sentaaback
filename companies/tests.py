@@ -1,6 +1,12 @@
+from unittest.mock import patch
+
+from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
 from rest_framework.test import APITestCase
 
+from common.images.testing import fake_cloudinary_upload_result
+from common.images.testing import make_test_image_file
+from common.images.testing import use_test_cloudinary_credentials
 from companies.models import CompanyProfile
 from jobs.models import JobOffer
 from marketplace.models import Category
@@ -40,6 +46,58 @@ class CompanyProfileTests(APITestCase):
         response = self.client.patch("/api/companies/me/", {"is_verified": True})
         self.assertEqual(response.status_code, 200)
         self.assertFalse(CompanyProfile.objects.get(owner=self.user).is_verified)
+
+    @patch("cloudinary.uploader.upload")
+    def test_upload_logo_via_me_endpoint(self, mock_upload):
+        # La réponse sérialise `logo` (voir CompanyProfileSerializer) : construit une URL de
+        # délivrance (voir common/images/delivery.py), qui a besoin d'un cloud_name — absent
+        # de l'environnement de test (voir CLOUDINARY dans back_sentaa/settings.py).
+        self.addCleanup(use_test_cloudinary_credentials())
+        mock_upload.return_value = fake_cloudinary_upload_result(
+            public_id="sentaa/companies/logos/x"
+        )
+        response = self.client.patch(
+            "/api/companies/me/",
+            {"name": "Kmer Fashion", "logo": make_test_image_file()},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIsInstance(response.data["logo"], str)
+        self.assertTrue(response.data["logo"])
+        mock_upload.assert_called_once()
+
+    def test_rejects_invalid_logo_without_calling_cloudinary(self):
+        bad_file = SimpleUploadedFile(
+            "logo.jpg", b"pas une image", content_type="image/jpeg"
+        )
+        with patch("cloudinary.uploader.upload") as mock_upload:
+            response = self.client.patch(
+                "/api/companies/me/",
+                {"name": "Kmer Fashion", "logo": bad_file},
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 400)
+        mock_upload.assert_not_called()
+        self.assertFalse(CompanyProfile.objects.filter(owner=self.user).exists())
+
+    @patch("cloudinary.uploader.upload")
+    def test_deleting_profile_cleans_up_cloudinary_logo(self, mock_upload):
+        self.addCleanup(use_test_cloudinary_credentials())
+        mock_upload.return_value = fake_cloudinary_upload_result(
+            public_id="sentaa/companies/logos/x"
+        )
+        self.client.patch(
+            "/api/companies/me/",
+            {"name": "Kmer Fashion", "logo": make_test_image_file()},
+            format="multipart",
+        )
+        profile = CompanyProfile.objects.get(owner=self.user)
+
+        with patch("cloudinary.uploader.destroy") as mock_destroy:
+            profile.delete()
+        mock_destroy.assert_called_once_with(
+            "sentaa/companies/logos/x", resource_type="image", type="upload"
+        )
 
     def test_public_page_lists_active_listings_and_jobs(self):
         company = CompanyProfile.objects.create(

@@ -1,3 +1,4 @@
+import secrets
 import uuid
 
 from django.db import models
@@ -32,6 +33,9 @@ class Delivery(models.Model):
         default="pending_assignment",
         db_index=True,
     )
+    confirmation_code = models.CharField(max_length=6, blank=True)
+    confirmation_attempts = models.PositiveSmallIntegerField(default=0)
+    confirmation_locked_until = models.DateTimeField(null=True, blank=True)
 
     # Coordonnées GPS uniquement (pas d'adresse texte comme source de vérité)
     pickup_latitude = models.DecimalField(
@@ -68,6 +72,8 @@ class Delivery(models.Model):
     def save(self, *args, **kwargs):
         if not self.tracking_number:
             self.tracking_number = f"SENTAA-{uuid.uuid4().hex[:10].upper()}"
+        if not self.confirmation_code:
+            self.confirmation_code = f"{secrets.randbelow(1_000_000):06d}"
         super().save(*args, **kwargs)
 
     def __str__(self):

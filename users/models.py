@@ -1,10 +1,18 @@
 import uuid
 
+from cloudinary.models import CloudinaryField
+from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser
 from django.contrib.auth.models import BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.db import models
 from phonenumber_field.modelfields import PhoneNumberField
+
+from common.images.validators import ImageFileValidator
+
+
+def courier_document_public_id(instance):
+    return f"{settings.CLOUDINARY_FOLDER_PREFIX}/users/courier_docs/{instance.id}"
 
 
 class CustomUserManager(BaseUserManager):
@@ -55,6 +63,34 @@ class User(AbstractBaseUser, PermissionsMixin):
     )
     courier_application_status = models.CharField(
         max_length=10, choices=COURIER_APPLICATION_CHOICES, default="none"
+    )
+
+    COURIER_VEHICLE_CHOICES = (
+        ("moto", "Moto"),
+        ("velo", "Vélo"),
+        ("voiture", "Voiture"),
+    )
+
+    courier_vehicle_type = models.CharField(
+        max_length=10, choices=COURIER_VEHICLE_CHOICES, blank=True
+    )
+
+    courier_id_document = CloudinaryField(
+        resource_type="image",
+        type="authenticated",
+        public_id=courier_document_public_id,
+        overwrite=True,
+        invalidate=True,
+        unique_filename=False,
+        use_filename=False,
+        allowed_formats=["jpg", "jpeg", "png", "webp"],
+        validators=[ImageFileValidator(max_bytes=5 * 1024 * 1024)],
+        null=True,
+        blank=True,
+        help_text=(
+            "Pièce d'identité pour la candidature coursier. Stockée sur Cloudinary en "
+            "accès restreint (non public)."
+        ),
     )
 
     objects = CustomUserManager()
