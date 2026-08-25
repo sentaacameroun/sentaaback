@@ -15,20 +15,22 @@ from channels.routing import ProtocolTypeRouter
 from channels.routing import URLRouter
 from django.core.asgi import get_asgi_application
 
-from chat.middleware import JWTAuthMiddleware  # noqa: E402
-from chat.routing import (
-    websocket_urlpatterns as chat_websocket_urlpatterns,
-)  # noqa: E402
-from logistics.routing import (
-    websocket_urlpatterns as logistics_websocket_urlpatterns,
-)  # noqa: E402
-
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "back_sentaa.settings")
 
-# django.setup() doit être terminé (via get_asgi_application()) avant d'importer
-# quoi que ce soit qui touche aux modèles/apps Django (routing, middleware, consumers).
+# django.setup() doit être terminé (via get_asgi_application()) avant d'importer quoi que ce
+# soit qui touche aux modèles/apps Django (routing, middleware, consumers) : ces imports
+# restent volontairement après cet appel, et volontairement hors du bloc trié par
+# reorder-python-imports (voir .pre-commit-config.yaml, exclude) qui les remonterait sinon
+# en tête de fichier et réintroduirait l'AppRegistryNotReady sous gunicorn/uvicorn.
 django_asgi_app = get_asgi_application()
 
+from chat.middleware import JWTAuthMiddleware  # noqa: E402
+from chat.routing import (  # noqa: E402
+    websocket_urlpatterns as chat_websocket_urlpatterns,
+)
+from logistics.routing import (  # noqa: E402
+    websocket_urlpatterns as logistics_websocket_urlpatterns,
+)
 
 application = ProtocolTypeRouter(
     {

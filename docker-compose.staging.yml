@@ -30,7 +30,12 @@ x-app-env: &app-env
   POSTGRES_PASS: ${POSTGRES_PASSWORD}
   POSTGRES_HOST: db
   POSTGRES_PORT: "5432"
+  # Les 3 forcés explicitement : sinon un .env qui définit CELERY_BROKER_URL/RESULT_BACKEND
+  # (ex. valeur loopback de .env.example, pour l'usage hors Docker) prend le pas sur REDIS_URL
+  # et pointe les workers vers 127.0.0.1 au lieu du service `redis` du réseau `backend`.
   REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/2
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
 
 services:
 
