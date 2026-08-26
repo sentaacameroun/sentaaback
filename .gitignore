@@ -169,6 +169,5 @@ static_files/summernote/
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml
-landing/
 
 **/*Zone.Identifier

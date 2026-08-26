@@ -7,20 +7,21 @@ Docker partagé entre stacks) :
                       ┌──────────────────────────────────────────┐
    Internet 443 ─────▶│  Gateway nginx (docker-compose.gateway)  │  TLS (Let's Encrypt)
                       │  network_mode: host                       │
-                      └───────────┬──────────────────┬───────────┘
-                     api.sentaa.net           dev.sentaa.net
-                          │ 127.0.0.1:8001          │ 127.0.0.1:8002
-              ┌───────────▼──────────┐   ┌──────────▼───────────┐
-              │  Stack PROD          │   │  Stack STAGING       │
-              │  docker-compose.prod │   │  docker-compose.stag.│
-              │  nginx→web→celery… db │   │  nginx→web→celery… db │
-              │  projet: sentaa-prod │   │  projet:sentaa-staging│
-              └──────────────────────┘   └──────────────────────┘
+                      └──────┬───────────────┬───────────────┬───┘
+                 api.sentaa.net      dev.sentaa.net      sentaa.net (+ www)
+                      │ 127.0.0.1:8001   │ 127.0.0.1:8002      │ fichiers statiques
+          ┌───────────▼──────────┐ ┌─────▼────────────────┐ ┌──▼─────────────────┐
+          │  Stack PROD          │ │  Stack STAGING        │ │  Site vitrine       │
+          │  docker-compose.prod │ │  docker-compose.stag. │ │  /var/www/sentaa.net│
+          │  nginx→web→celery…db │ │  nginx→web→celery…db  │ │  (html/css/js)      │
+          │  projet: sentaa-prod │ │  projet:sentaa-staging│ │  servi directement  │
+          └───────────────────────┘ └────────────────────────┘ └─────────────────────┘
 ```
 
 1. **Gateway** (`docker-compose.gateway.yml`) — seul service sur `80/443`, termine le TLS,
    route chaque domaine vers le nginx interne du stack via la loopback. Tourne en
-   `network_mode: host`. Config : `nginx/nginx.conf`.
+   `network_mode: host`. Config : `nginx/nginx.conf`. Sert aussi directement le **site
+   vitrine statique** `sentaa.net` (html/css/js, dépôt séparé — pas de proxy vers un stack).
 2. **Stacks applicatifs** (`docker-compose.prod.yml` / `docker-compose.staging.yml`) — chacun
    complet et isolé (projet/volumes/réseaux séparés) : `db` + `redis` + `web` (Django ASGI) +
    `celery_worker` + `celery_beat` + `flower` + `nginx` interne. Le nginx interne sert
@@ -37,7 +38,8 @@ Le CI/CD (`.github/workflows/deploy.yml`) build **sur le VPS** : `git reset --ha
 ## Mise en place initiale du VPS (une seule fois)
 
 Prérequis : Docker + Docker Compose v2, utilisateur non-root dans le groupe `docker`,
-DNS `api.sentaa.net` **et** `dev.sentaa.net` pointant vers l'IP du VPS.
+DNS `api.sentaa.net`, `dev.sentaa.net`, `sentaa.net` **et** `www.sentaa.net` pointant vers
+l'IP du VPS.
 
 ### 1. Cloner le repo dans les deux dossiers
 
@@ -74,7 +76,29 @@ CERTBOT_EMAIL=contact@sentaa.net ./scripts/setup-ssl.sh
 
 Émet le certificat SAN (api + dev), démarre la gateway, installe le cron de renouvellement.
 
-### 4. Premier démarrage des stacks
+### 4. Site vitrine statique (sentaa.net)
+
+Dépôt séparé du backend (html/css/js « en dur », pas de build). À cloner **sur le VPS
+uniquement** (aucun CI/CD dans ce repo pour ce site — mise à jour manuelle via `git pull`) :
+
+```bash
+sudo mkdir -p /var/www/sentaa.net
+sudo git clone <url-du-repo-site> /var/www/sentaa.net
+```
+
+`index.html` doit être à la racine de ce dossier (c'est la racine servie par nginx). DNS
+`sentaa.net` **et** `www.sentaa.net` → IP du VPS, puis, une fois la gateway démarrée (étape 3) :
+
+```bash
+cd /var/www/sentaa-backend   # n'importe quel checkout du repo backend suffit
+CERTBOT_EMAIL=contact@sentaa.net ./scripts/setup-ssl-site.sh
+```
+
+Émet un certificat séparé de celui d'api/dev (`sentaa.net` + `www.sentaa.net`), recharge la
+gateway. `www.sentaa.net` redirige en 301 vers `sentaa.net`. Mise à jour ensuite :
+`cd /var/www/sentaa.net && sudo git pull` — nginx sert les fichiers directement, pas de restart.
+
+### 5. Premier démarrage des stacks
 
 ```bash
 cd /var/www/sentaa-backend     && docker compose -f docker-compose.prod.yml    up -d --build
@@ -83,7 +107,7 @@ cd /var/www/sentaa-backend-dev && docker compose -f docker-compose.staging.yml u
 
 `web` joue automatiquement `migrate` + `collectstatic` (via `entrypoint.sh`, `RUN_MIGRATIONS=true`).
 
-### 5. Secrets GitHub (Settings → Environments : `staging` et `prod`)
+### 6. Secrets GitHub (Settings → Environments : `staging` et `prod`)
 
 | Secret         | Description                                  |
 |----------------|----------------------------------------------|

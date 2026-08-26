@@ -8,6 +8,9 @@
 # directement le nginx interne de chaque stack via la loopback (127.0.0.1:8001 prod,
 # 127.0.0.1:8002 staging) — ces ports ne sont pas exposés à internet — et sert le challenge
 # ACME + les certificats depuis les répertoires certbot montés depuis l'hôte.
+#
+# Sert aussi le site vitrine statique (sentaa.net, html/css/js, dépôt séparé du backend) :
+# clone-le dans /var/www/sentaa.net sur le VPS (voir deploy/README.md), monté en lecture seule.
 name: sentaa-gateway
 
 services:
@@ -19,6 +22,7 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - /var/www/certbot:/var/www/certbot:ro
+      - /var/www/sentaa.net:/var/www/site:ro
     deploy:
       resources:
         limits:
