@@ -1,23 +1,46 @@
-<p>Bonjour {{ user.first_name }},</p>
-<p>Voici les nouveautés de la semaine sur Senta'a :</p>
+{% extends "emails/base_email.html" %}
+
+{% block title %}Les nouveautés de la semaine — Senta'a{% endblock %}
+{% block preheader %}De nouvelles annonces et offres d'emploi vous attendent sur Senta'a.{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Bonjour {{ user.first_name }},</p>
+<p style="margin:0 0 20px;">Voici les nouveautés de la semaine sur Senta'a :</p>
 
 {% if listings %}
-<h3>Nouvelles annonces</h3>
-<ul>
+<p style="margin:0 0 8px;font-size:12px;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;color:#5FA5C8;">Nouvelles annonces</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px;">
   {% for listing in listings %}
-  <li>{{ listing.title }} — {{ listing.price }} XAF ({{ listing.city }})</li>
+  <tr>
+    <td style="padding:10px 0;border-bottom:1px solid #ECEFEC;">
+      <p style="margin:0 0 2px;font-size:14px;font-weight:bold;color:#22282B;">{{ listing.title }}</p>
+      <p style="margin:0;font-size:13px;color:#8A9299;">{{ listing.price }} XAF · {{ listing.city }}</p>
+    </td>
+  </tr>
   {% endfor %}
-</ul>
+</table>
 {% endif %}
 
 {% if job_offers %}
-<h3>Nouvelles offres d'emploi</h3>
-<ul>
+<p style="margin:0 0 8px;font-size:12px;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;color:#A5CB41;">Nouvelles offres d'emploi</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 8px;">
   {% for job in job_offers %}
-  <li>{{ job.title }} — {{ job.company_name }} ({{ job.location }})</li>
+  <tr>
+    <td style="padding:10px 0;border-bottom:1px solid #ECEFEC;">
+      <p style="margin:0 0 2px;font-size:14px;font-weight:bold;color:#22282B;">{{ job.title }}</p>
+      <p style="margin:0;font-size:13px;color:#8A9299;">{{ job.company_name }} · {{ job.location }}</p>
+    </td>
+  </tr>
   {% endfor %}
-</ul>
+</table>
 {% endif %}
 
-<p>— L'équipe Senta'a</p>
-<p style="font-size:11px;color:#888;">Vous recevez cet email car vous êtes inscrit à la newsletter Senta'a. Vous pouvez vous désinscrire depuis les paramètres de votre compte.</p>
+{% include "emails/_button.html" with button_url=site_url button_label="Découvrir Senta'a" %}
+
+<p style="margin:20px 0 0;">— L'équipe Senta'a</p>
+{% endblock %}
+
+{% block footer %}
+<p style="margin:0 0 4px;">Senta'a — {{ company_postal_address }}</p>
+<p style="margin:0;">Vous recevez cet email car vous êtes inscrit à la newsletter Senta'a. <a href="{{ unsubscribe_url }}" style="color:#8A9299;text-decoration:underline;">Se désinscrire</a>.</p>
+{% endblock %}

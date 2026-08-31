@@ -15,6 +15,7 @@ from .models import Order
 from .models import PaymentTransaction
 from .serializers import SHIPPING_BASE_FEE
 from .serializers import SHIPPING_FEE_PER_KM
+from .services.delivery_hooks import on_order_paid
 from .services.notchpay_client import NotchPayError
 from .services.order_lifecycle import OrderLifecycleError
 from .services.order_lifecycle import OrderLifecycleService
@@ -702,3 +703,113 @@ class PaymentSafetyTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         order.refresh_from_db()
         self.assertEqual(order.status, "paid_escrow")
+
+
+class PushNotificationHooksTests(APITestCase):
+    """BE-PUSH-2 — branchement des pushs sur le cycle de vie de la commande (voir
+    PUSH_NOTIFICATIONS_PLAN.md). Seule la planification Celery (`.delay`) est vérifiée ici ;
+    l'envoi réel est déjà couvert par notifications/tests.py (BE-PUSH-1)."""
+
+    def setUp(self):
+        self.buyer = User.objects.create_user(
+            phone_number="+237611900000", first_name="Acheteur", last_name="Test"
+        )
+        self.seller = User.objects.create_user(
+            phone_number="+237622900000", first_name="Vendeur", last_name="Test"
+        )
+        self.cat = Category.objects.create(name="Test", slug="test-push")
+        self.listing = Listing.objects.create(
+            seller=self.seller,
+            title="Objet",
+            description="desc",
+            price=1000,
+            category=self.cat,
+        )
+
+    def _create_order(self, **kwargs):
+        defaults = dict(
+            buyer=self.buyer,
+            listing=self.listing,
+            item_price=1000,
+            service_fee=30,
+            total_amount=1030,
+        )
+        defaults.update(kwargs)
+        return Order.objects.create(**defaults)
+
+    @patch("escrow.services.delivery_hooks.send_push_notification_task.delay")
+    def test_order_paid_notifies_seller(self, mock_delay):
+        order = self._create_order(status="paid_escrow")
+
+        # Le push n'est planifié qu'après commit (transaction.on_commit) — captureOnCommit-
+        # Callbacks simule ce commit sans dépendre d'une vraie transaction DB en cours.
+        with self.captureOnCommitCallbacks(execute=True):
+            on_order_paid(order)
+
+        mock_delay.assert_called_once_with(
+            user_id=self.seller.id,
+            title="Nouvelle commande payée",
+            body="Nouvelle commande payée — prépare l'envoi",
+            data={"type": "order", "id": str(order.id)},
+        )
+
+    @patch("escrow.services.order_lifecycle.send_push_notification_task.delay")
+    def test_mark_delivered_notifies_buyer(self, mock_delay):
+        order = self._create_order(status="shipped")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            OrderLifecycleService.mark_delivered(order.id, actor=self.buyer)
+
+        mock_delay.assert_called_once_with(
+            user_id=self.buyer.id,
+            title="Commande livrée",
+            body="Ta commande est arrivée — confirme la réception",
+            data={"type": "order", "id": str(order.id)},
+        )
+
+    @patch("escrow.services.order_lifecycle.send_push_notification_task.delay")
+    def test_mark_delivered_no_renotification_on_idempotent_replay(self, mock_delay):
+        # Régression : un second appel sur une commande déjà `delivered` est un no-op — il
+        # ne doit pas renvoyer une notification à l'acheteur.
+        order = self._create_order(status="delivered")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            OrderLifecycleService.mark_delivered(order.id, actor=self.buyer)
+
+        mock_delay.assert_not_called()
+
+    @patch("escrow.services.order_lifecycle.send_push_notification_task.delay")
+    @patch("escrow.services.payouts.NotchPayClient.initialize_transfer")
+    def test_complete_and_release_notifies_seller(self, mock_transfer, mock_delay):
+        mock_transfer.return_value = {"transaction": {"reference": "payout-ref"}}
+        order = self._create_order(status="delivered")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            OrderLifecycleService.complete_and_release(order.id, actor=self.buyer)
+
+        mock_delay.assert_called_once_with(
+            user_id=self.seller.id,
+            title="Paiement reçu",
+            body="Tu as été payé pour ton annonce",
+            data={"type": "order", "id": str(order.id)},
+        )
+
+    @patch("escrow.services.order_lifecycle.send_push_notification_task.delay")
+    @patch("escrow.services.payouts.NotchPayClient.initialize_transfer")
+    def test_complete_and_release_no_renotification_on_idempotent_replay(
+        self, mock_transfer, mock_delay
+    ):
+        # Symétrique de test_mark_delivered_no_renotification_on_idempotent_replay : un
+        # second appel sur une commande déjà `completed` (fonds déjà libérés) est un no-op
+        # sûr — il ne doit pas renvoyer une seconde notification au vendeur.
+        mock_transfer.return_value = {"transaction": {"reference": "payout-ref"}}
+        order = self._create_order(status="delivered")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            OrderLifecycleService.complete_and_release(order.id, actor=self.buyer)
+        mock_delay.reset_mock()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            OrderLifecycleService.complete_and_release(order.id, actor=self.buyer)
+
+        mock_delay.assert_not_called()

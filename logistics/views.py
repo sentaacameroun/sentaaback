@@ -25,6 +25,7 @@ from logistics.serializers import DeliveryConfirmSerializer
 from logistics.serializers import DeliveryLocationUpdateSerializer
 from logistics.serializers import DeliverySerializer
 from logistics.serializers import DeliveryStatusUpdateSerializer
+from notifications.tasks import send_push_notification_task
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,15 @@ class DeliveryViewSet(
             return Response(
                 {"error": "Cette livraison n'est plus disponible."}, status=409
             )
-        delivery = Delivery.objects.get(pk=pk)
+        delivery = Delivery.objects.select_related("order").get(pk=pk)
+        transaction.on_commit(
+            lambda: send_push_notification_task.delay(
+                user_id=delivery.order.buyer_id,
+                title="Livreur en route",
+                body="Un livreur a pris en charge ta commande",
+                data={"type": "order", "id": str(delivery.order_id)},
+            )
+        )
         return Response(self.get_serializer(delivery).data)
 
     @action(detail=True, methods=["post"], url_path="update-status")

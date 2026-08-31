@@ -1,0 +1,5 @@
+{% block content %}{% endblock %}
+
+--
+Senta'a — {{ company_postal_address }}
+{% block footer %}Vous recevez cet email car vous avez un compte Senta'a.{% endblock %}

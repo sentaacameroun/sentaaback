@@ -1,0 +1,20 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Votre code de connexion — Senta'a{% endblock %}
+{% block preheader %}Voici votre code de connexion Senta'a.{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Bonjour,</p>
+<p style="margin:0 0 20px;">Voici votre code de connexion Senta'a :</p>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px;">
+  <tr>
+    <td align="center" style="background-color:#F9FAF8;border-radius:8px;padding:20px;">
+      <span style="font-family:'Courier New',Courier,monospace;font-size:32px;font-weight:bold;letter-spacing:8px;color:#2E7DA6;">{{ otp }}</span>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:0 0 8px;">Ce code expire dans 5 minutes.</p>
+<p style="margin:0;color:#8A9299;font-size:13px;">Si vous n'êtes pas à l'origine de cette demande, ignorez cet email — votre compte reste protégé.</p>
+{% endblock %}

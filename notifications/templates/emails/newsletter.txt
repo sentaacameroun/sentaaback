@@ -1,0 +1,17 @@
+{% extends "emails/base_email.txt" %}
+{% block content %}Bonjour {{ user.first_name }},
+
+Voici les nouveautés de la semaine sur Senta'a :
+{% if listings %}
+Nouvelles annonces :
+{% for listing in listings %}  - {{ listing.title }} — {{ listing.price }} XAF ({{ listing.city }})
+{% endfor %}{% endif %}{% if job_offers %}
+Nouvelles offres d'emploi :
+{% for job in job_offers %}  - {{ job.title }} — {{ job.company_name }} ({{ job.location }})
+{% endfor %}{% endif %}
+Découvrir Senta'a : {{ site_url }}
+
+— L'équipe Senta'a{% endblock %}
+
+{% block footer %}Vous recevez cet email car vous êtes inscrit à la newsletter Senta'a.
+Se désinscrire : {{ unsubscribe_url }}{% endblock %}

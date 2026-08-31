@@ -218,6 +218,39 @@ class LogisticsTests(APITestCase):
         response = client.post(f"/api/deliveries/{delivery.id}/claim/")
         self.assertEqual(response.status_code, 409)
 
+    @patch("logistics.views.send_push_notification_task.delay")
+    def test_claim_notifies_buyer(self, mock_delay):
+        # BE-PUSH-2 : l'acheteur est notifié qu'un livreur a pris en charge sa commande.
+        delivery = Delivery.objects.create(order=self.order)
+        client = APIClient()
+        client.force_authenticate(user=self.courier)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = client.post(f"/api/deliveries/{delivery.id}/claim/")
+
+        self.assertEqual(response.status_code, 200)
+        mock_delay.assert_called_once_with(
+            user_id=self.buyer.id,
+            title="Livreur en route",
+            body="Un livreur a pris en charge ta commande",
+            data={"type": "order", "id": str(self.order.id)},
+        )
+
+    @patch("logistics.views.send_push_notification_task.delay")
+    def test_claim_conflict_does_not_notify(self, mock_delay):
+        # Cas concurrent : le perdant du claim (409) ne doit déclencher aucune notification.
+        delivery = Delivery.objects.create(
+            order=self.order, courier=self.courier, status="assigned"
+        )
+        client = APIClient()
+        client.force_authenticate(user=self.other_courier)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = client.post(f"/api/deliveries/{delivery.id}/claim/")
+
+        self.assertEqual(response.status_code, 409)
+        mock_delay.assert_not_called()
+
     def _advance_to_in_transit(self, delivery):
         client = APIClient()
         client.force_authenticate(user=self.courier)

@@ -1,0 +1,8 @@
+{% extends "emails/base_email.txt" %}
+{% block content %}Bonjour {{ buyer.first_name }},
+
+Votre commande "{{ order.listing.title }}" ({{ order.total_amount }} XAF) est en attente de
+paiement depuis un moment. Finalisez le paiement Mobile Money dans l'application Senta'a
+pour ne pas perdre l'article.
+
+— L'équipe Senta'a{% endblock %}

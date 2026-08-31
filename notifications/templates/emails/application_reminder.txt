@@ -1,0 +1,7 @@
+{% extends "emails/base_email.txt" %}
+{% block content %}Bonjour {{ recruiter.first_name }},
+
+Votre offre "{{ job_offer.title }}" a {{ pending_count }} candidature{{ pending_count|pluralize }}
+en attente de traitement depuis plusieurs jours. Connectez-vous à Senta'a pour les consulter.
+
+— L'équipe Senta'a{% endblock %}

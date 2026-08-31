@@ -1,4 +1,21 @@
-<p>Bonjour {{ buyer.first_name }},</p>
-<p>Votre commande <strong>{{ order.listing.title }}</strong> ({{ order.total_amount }} XAF) est en attente de paiement depuis un moment.</p>
-<p>Finalisez le paiement Mobile Money dans l'application Senta'a pour ne pas perdre votre article.</p>
-<p>— L'équipe Senta'a</p>
+{% extends "emails/base_email.html" %}
+
+{% block title %}Finalisez votre paiement — Senta'a{% endblock %}
+{% block preheader %}Votre commande "{{ order.listing.title }}" attend toujours son paiement.{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Bonjour {{ buyer.first_name }},</p>
+<p style="margin:0 0 16px;">Votre commande est en attente de paiement depuis un moment. Finalisez le règlement Mobile Money dans l'application Senta'a pour ne pas perdre l'article.</p>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#F9FAF8;border-radius:8px;margin:8px 0 20px;">
+  <tr>
+    <td style="padding:16px 20px;">
+      <p style="margin:0 0 4px;font-size:13px;color:#8A9299;">Commande</p>
+      <p style="margin:0 0 8px;font-size:16px;font-weight:bold;color:#22282B;">{{ order.listing.title }}</p>
+      <p style="margin:0;font-size:20px;font-weight:bold;color:#2E7DA6;">{{ order.total_amount }} XAF</p>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:0;">— L'équipe Senta'a</p>
+{% endblock %}

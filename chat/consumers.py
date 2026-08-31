@@ -1,8 +1,10 @@
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from django.db import transaction
 
 from chat.models import Conversation
 from chat.models import Message
+from notifications.tasks import send_push_notification_task
 
 
 class ChatConsumer(AsyncJsonWebsocketConsumer):
@@ -58,6 +60,22 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def _create_message(self, user, body):
-        return Message.objects.create(
+        message = Message.objects.create(
             conversation_id=self.conversation_id, sender=user, body=body
         )
+        # Destinataires = les autres participants de la conversation, jamais l'auteur. Le
+        # corps du push ne contient jamais le texte du message (voir .claude/rules/
+        # push-notifications.md).
+        recipient_ids = message.conversation.participants.exclude(
+            pk=user.pk
+        ).values_list("id", flat=True)
+        for recipient_id in recipient_ids:
+            transaction.on_commit(
+                lambda recipient_id=recipient_id: send_push_notification_task.delay(
+                    user_id=recipient_id,
+                    title="Nouveau message",
+                    body=f"Nouveau message de {user.first_name}",
+                    data={"type": "chat", "id": str(message.conversation_id)},
+                )
+            )
+        return message

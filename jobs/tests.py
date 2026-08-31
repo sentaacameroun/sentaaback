@@ -1,7 +1,10 @@
+from unittest.mock import patch
+
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
 from rest_framework.test import APITestCase
 
+from jobs.models import JobApplication
 from jobs.models import JobOffer
 from users.models import User
 
@@ -91,3 +94,90 @@ class JobTests(APITestCase):
 
         response = self.client.post(f"/api/job-offers/{self.job.id}/toggle_favorite/")
         self.assertEqual(response.data, {"favorited": False})
+
+
+class JobApplicationPushNotificationTests(APITestCase):
+    """BE-PUSH-2 — branchement des pushs sur les candidatures (voir PUSH_NOTIFICATIONS_PLAN.md)."""
+
+    def setUp(self):
+        self.recruiter = User.objects.create_user(
+            phone_number="+237699000001",
+            first_name="Boss",
+            last_name="Recruiter",
+            is_recruiter=True,
+        )
+        self.talent = User.objects.create_user(
+            phone_number="+237688000001", first_name="Dev", last_name="Python"
+        )
+        self.job = JobOffer.objects.create(
+            recruiter=self.recruiter, title="Dev Python", company_name="Sentaa Corp"
+        )
+        self.client = APIClient()
+
+    @patch("jobs.views.send_push_notification_task.delay")
+    def test_new_application_notifies_recruiter(self, mock_delay):
+        self.client.force_authenticate(user=self.talent)
+        dummy_cv = SimpleUploadedFile(
+            "cv.pdf",
+            b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nendobj\n%%EOF",
+            content_type="application/pdf",
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                "/api/job-applications/",
+                {"job": self.job.id, "cv_file": dummy_cv, "message": "Je suis motivé"},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        mock_delay.assert_called_once_with(
+            user_id=self.recruiter.id,
+            title="Nouvelle candidature",
+            body="Nouvelle candidature pour Dev Python",
+            data={"type": "job_application", "id": response.data["id"]},
+        )
+
+    @patch("jobs.views.send_push_notification_task.delay")
+    def test_application_status_change_notifies_applicant(self, mock_delay):
+        application = JobApplication.objects.create(
+            job=self.job, applicant=self.talent, message="Bonjour"
+        )
+        self.client.force_authenticate(user=self.recruiter)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/job-applications/{application.id}/accept/"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_delay.assert_called_once_with(
+            user_id=self.talent.id,
+            title="Candidature mise à jour",
+            body="Ta candidature a été mise à jour",
+            data={"type": "job_application", "id": str(application.id)},
+        )
+
+    @patch("jobs.views.send_push_notification_task.delay")
+    def test_application_status_change_by_non_owner_is_forbidden_and_does_not_notify(
+        self, mock_delay
+    ):
+        # Cas d'accès non autorisé : un recruteur qui n'est pas propriétaire de l'offre ne
+        # peut pas répondre à cette candidature — et ne doit donc déclencher aucun push.
+        other_recruiter = User.objects.create_user(
+            phone_number="+237699000002",
+            first_name="Autre",
+            last_name="Recruiter",
+            is_recruiter=True,
+        )
+        application = JobApplication.objects.create(
+            job=self.job, applicant=self.talent, message="Bonjour"
+        )
+        self.client.force_authenticate(user=other_recruiter)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/job-applications/{application.id}/accept/"
+            )
+
+        self.assertEqual(response.status_code, 404)
+        mock_delay.assert_not_called()
