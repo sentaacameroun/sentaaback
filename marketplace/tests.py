@@ -317,3 +317,51 @@ class OfferNegotiationTests(APITestCase):
         order = Order.objects.get(id=response.data["id"])
         self.assertEqual(order.item_price, 700)
         self.assertEqual(str(order.offer_id), offer_id)
+
+    @patch("marketplace.views.send_push_notification_task.delay")
+    def test_new_offer_notifies_seller(self, mock_delay):
+        # BE-PUSH-2 : le vendeur est notifié d'une nouvelle offre sur son annonce.
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.buyer_client.post(
+                "/api/offers/", {"listing": self.listing.id, "proposed_price": "800.00"}
+            )
+
+        self.assertEqual(response.status_code, 201)
+        mock_delay.assert_called_once_with(
+            user_id=self.seller.id,
+            title="Nouvelle offre",
+            body="Nouvelle offre sur ton annonce",
+            data={"type": "offer", "id": response.data["id"]},
+        )
+
+    @patch("marketplace.views.send_push_notification_task.delay")
+    def test_offer_accept_notifies_the_party_who_did_not_act(self, mock_delay):
+        # BE-PUSH-2 : la contre-offre du seller notifie le buyer (qui n'a pas agi), puis
+        # l'acceptation du buyer notifie le seller (qui n'a pas agi) — jamais l'auteur de
+        # l'action en cours.
+        response = self.buyer_client.post(
+            "/api/offers/", {"listing": self.listing.id, "proposed_price": "800.00"}
+        )
+        offer_id = response.data["id"]
+        mock_delay.reset_mock()  # on ignore la notification de création ci-dessus
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.seller_client.post(
+                f"/api/offers/{offer_id}/counter/", {"proposed_price": "900.00"}
+            )
+        mock_delay.assert_called_once_with(
+            user_id=self.buyer.id,
+            title="Réponse à ta proposition",
+            body="Ta proposition a été contre-proposée",
+            data={"type": "offer", "id": offer_id},
+        )
+        mock_delay.reset_mock()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.buyer_client.post(f"/api/offers/{offer_id}/accept/")
+        mock_delay.assert_called_once_with(
+            user_id=self.seller.id,
+            title="Réponse à ta proposition",
+            body="Ta proposition a été acceptée",
+            data={"type": "offer", "id": offer_id},
+        )

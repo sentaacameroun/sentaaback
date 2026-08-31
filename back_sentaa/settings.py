@@ -448,6 +448,27 @@ else:
     EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "no-reply@senta-a.com")
 
+# Domaine public du backend : sert à construire des URLs ABSOLUES dans les emails (logo
+# statique, lien de désinscription newsletter) — un client mail ne connaît pas la même
+# origine qu'un navigateur, `static()`/`reverse()` seuls ne renvoient qu'un chemin relatif.
+# Doit rester cohérent avec ALLOWED_HOSTS (voir plus haut).
+BACKEND_PUBLIC_URL = os.getenv(
+    "BACKEND_PUBLIC_URL", "https://sentaaback.onrender.com"
+).rstrip("/")
+
+# Mention légale (pied de page email newsletter, anti-spam CAN-SPAM/RGPD — voir
+# notifications/emails.py). Ville/pays uniquement : pas d'adresse postale précise disponible
+# pour l'instant.
+COMPANY_POSTAL_ADDRESS = os.getenv("COMPANY_POSTAL_ADDRESS", "Douala, Cameroun")
+
+# Firebase Cloud Messaging (push notifications, voir notifications/) : contenu JSON complet
+# du compte de service (PAS un chemin de fichier — volontaire, pour ne jamais avoir à déposer
+# ce fichier sur le VPS), lu depuis l'environnement — jamais codé en dur, secret au même titre
+# que les clés NotchPay ci-dessus (voir .claude/rules/push-notifications.md). Vide en
+# dev/tests : notifications/services/push.py lève explicitement si un envoi est tenté sans
+# credentials, plutôt que d'échouer silencieusement.
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+
 # Logging : sortie console structurée, lisible via `docker logs` / `docker compose logs`.
 LOGGING = {
     "version": 1,

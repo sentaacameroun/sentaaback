@@ -1,3 +1,4 @@
+from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from rest_framework import permissions
@@ -13,6 +14,7 @@ from jobs.permissions import IsOwnerRecruiter
 from jobs.permissions import IsVerifiedRecruiter
 from jobs.serializers import JobApplicationSerializer
 from jobs.serializers import JobOfferSerializer
+from notifications.tasks import send_push_notification_task
 
 
 class JobOfferViewSet(viewsets.ModelViewSet):
@@ -83,7 +85,15 @@ class JobApplicationViewSet(viewsets.ModelViewSet):
         return super().get_permissions()
 
     def perform_create(self, serializer):
-        serializer.save(applicant=self.request.user)
+        application = serializer.save(applicant=self.request.user)
+        transaction.on_commit(
+            lambda: send_push_notification_task.delay(
+                user_id=application.job.recruiter_id,
+                title="Nouvelle candidature",
+                body=f"Nouvelle candidature pour {application.job.title}",
+                data={"type": "job_application", "id": str(application.id)},
+            )
+        )
 
     # `JobApplicationSerializer.status` est en lecture seule pour tout le monde (y compris
     # le recruteur) — jusqu'ici aucun endpoint ne permettait à un recruteur de répondre à une
@@ -92,6 +102,14 @@ class JobApplicationViewSet(viewsets.ModelViewSet):
         application = self.get_object()
         application.status = new_status
         application.save(update_fields=["status"])
+        transaction.on_commit(
+            lambda: send_push_notification_task.delay(
+                user_id=application.applicant_id,
+                title="Candidature mise à jour",
+                body="Ta candidature a été mise à jour",
+                data={"type": "job_application", "id": str(application.id)},
+            )
+        )
         return Response(JobApplicationSerializer(application).data)
 
     @action(detail=True, methods=["post"])

@@ -26,6 +26,7 @@ from django.utils import timezone
 from escrow.models import Order
 from escrow.models import PaymentTransaction
 from escrow.services.payouts import release_escrow_funds
+from notifications.tasks import send_push_notification_task
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,15 @@ class OrderLifecycleService:
 
             order.status = "delivered"
             order.save(update_fields=["status", "updated_at"])
+
+            transaction.on_commit(
+                lambda: send_push_notification_task.delay(
+                    user_id=order.buyer_id,
+                    title="Commande livrée",
+                    body="Ta commande est arrivée — confirme la réception",
+                    data={"type": "order", "id": str(order.id)},
+                )
+            )
 
         logger.info(
             "Order %s marquée 'delivered' par l'acteur %s",
@@ -102,6 +112,15 @@ class OrderLifecycleService:
             order.status = "completed"
             order.payout_at = timezone.now()
             order.save(update_fields=["status", "payout_at", "updated_at"])
+
+            transaction.on_commit(
+                lambda: send_push_notification_task.delay(
+                    user_id=order.listing.seller_id,
+                    title="Paiement reçu",
+                    body="Tu as été payé pour ton annonce",
+                    data={"type": "order", "id": str(order.id)},
+                )
+            )
 
         # Appel réseau NotchPay hors du verrou DB (pas de lock tenu pendant l'I/O). La
         # sérialisation par select_for_update ci-dessus garantit qu'un seul appel atteint ce

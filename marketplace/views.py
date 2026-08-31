@@ -27,6 +27,7 @@ from marketplace.serializers import CategorySerializer
 from marketplace.serializers import ListingSerializer
 from marketplace.serializers import OfferRespondSerializer
 from marketplace.serializers import OfferSerializer
+from notifications.tasks import send_push_notification_task
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,12 @@ class OfferViewSet(
     serializer_class = OfferSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    _STATUS_LABELS = {
+        "accepted": "acceptée",
+        "rejected": "refusée",
+        "countered": "contre-proposée",
+    }
+
     def get_queryset(self):
         user = self.request.user
         return Offer.objects.filter(
@@ -216,8 +223,16 @@ class OfferViewSet(
         ).select_related("listing", "buyer", "last_offered_by")
 
     def perform_create(self, serializer):
-        serializer.save(
+        offer = serializer.save(
             buyer=self.request.user, last_offered_by=self.request.user, status="pending"
+        )
+        transaction.on_commit(
+            lambda: send_push_notification_task.delay(
+                user_id=offer.listing.seller_id,
+                title="Nouvelle offre",
+                body="Nouvelle offre sur ton annonce",
+                data={"type": "offer", "id": str(offer.id)},
+            )
         )
 
     def _respond(self, request, pk, new_status, require_price=False):
@@ -246,6 +261,21 @@ class OfferViewSet(
 
         offer.status = new_status
         offer.save()
+
+        # La partie qui répond n'est jamais celle qu'on notifie — on prévient l'autre partie
+        # (celle qui a proposé le prix courant, `last_offered_by`, avant cette réponse).
+        other_party_id = (
+            offer.listing.seller_id if user == offer.buyer else offer.buyer_id
+        )
+        label = self._STATUS_LABELS[new_status]
+        transaction.on_commit(
+            lambda: send_push_notification_task.delay(
+                user_id=other_party_id,
+                title="Réponse à ta proposition",
+                body=f"Ta proposition a été {label}",
+                data={"type": "offer", "id": str(offer.id)},
+            )
+        )
         return Response(OfferSerializer(offer).data)
 
     @action(detail=True, methods=["post"])

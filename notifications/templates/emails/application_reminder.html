@@ -1,4 +1,11 @@
-<p>Bonjour {{ recruiter.first_name }},</p>
-<p>Votre offre <strong>{{ job_offer.title }}</strong> a {{ pending_count }} candidature(s) en attente de traitement depuis plusieurs jours.</p>
-<p>Connectez-vous à Senta'a pour les consulter.</p>
-<p>— L'équipe Senta'a</p>
+{% extends "emails/base_email.html" %}
+
+{% block title %}Candidatures en attente — Senta'a{% endblock %}
+{% block preheader %}{{ pending_count }} candidature{{ pending_count|pluralize }} en attente pour "{{ job_offer.title }}".{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Bonjour {{ recruiter.first_name }},</p>
+<p style="margin:0 0 16px;">Votre offre <strong>{{ job_offer.title }}</strong> a {{ pending_count }} candidature{{ pending_count|pluralize }} en attente de traitement depuis plusieurs jours.</p>
+<p style="margin:0 0 16px;">Connectez-vous à Senta'a pour les consulter.</p>
+<p style="margin:0;">— L'équipe Senta'a</p>
+{% endblock %}

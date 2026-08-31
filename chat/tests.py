@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from channels.db import database_sync_to_async
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
@@ -138,3 +140,45 @@ class ChatWebsocketTests(TransactionTestCase):
         )
         connected, _ = await communicator.connect()
         self.assertFalse(connected)
+
+    @patch("chat.consumers.send_push_notification_task.delay")
+    async def test_new_message_notifies_other_participant_only(self, mock_delay):
+        # BE-PUSH-2 : le destinataire (hors auteur) est notifié, jamais avec le contenu du
+        # message (voir .claude/rules/push-notifications.md).
+        token = await self._get_token_async(self.buyer)
+        communicator = WebsocketCommunicator(
+            self._app(), f"/ws/chat/{self.conversation.id}/?token={token}"
+        )
+        await communicator.connect()
+
+        await communicator.send_json_to({"body": "Salut !"})
+        await communicator.receive_json_from()
+        await communicator.disconnect()
+
+        mock_delay.assert_called_once_with(
+            user_id=self.seller.id,
+            title="Nouveau message",
+            body=f"Nouveau message de {self.buyer.first_name}",
+            data={"type": "chat", "id": str(self.conversation.id)},
+        )
+
+    @patch("chat.consumers.send_push_notification_task.delay")
+    async def test_new_message_notifies_every_other_participant(self, mock_delay):
+        # Conversation à 3 : tous les autres participants sont notifiés, jamais l'auteur.
+        third = await database_sync_to_async(User.objects.create_user)(
+            phone_number="+237611300099", first_name="C", last_name="T"
+        )
+        await database_sync_to_async(self.conversation.participants.add)(third)
+
+        token = await self._get_token_async(self.buyer)
+        communicator = WebsocketCommunicator(
+            self._app(), f"/ws/chat/{self.conversation.id}/?token={token}"
+        )
+        await communicator.connect()
+
+        await communicator.send_json_to({"body": "Salut à tous"})
+        await communicator.receive_json_from()
+        await communicator.disconnect()
+
+        notified_ids = {call.kwargs["user_id"] for call in mock_delay.call_args_list}
+        self.assertEqual(notified_ids, {self.seller.id, third.id})

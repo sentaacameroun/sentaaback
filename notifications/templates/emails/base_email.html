@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="fr" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<meta name="x-apple-disable-message-reformatting">
+<title>{% block title %}Senta'a{% endblock %}</title>
+<!--[if mso]>
+<noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript>
+<![endif]-->
+<style>
+  /* Styles "progressive enhancement" : les propriétés qui comptent vraiment (couleurs,
+     tailles, paddings) sont aussi posées en inline sur chaque élément, pour les clients
+     (Outlook desktop notamment) qui ignorent ce bloc <style>. */
+  body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+  table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+  img { -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }
+  body { margin: 0; padding: 0; width: 100% !important; background-color: #F4F6F5; }
+  a { color: #2E7DA6; }
+  .email-container { max-width: 600px; }
+  @media screen and (max-width: 600px) {
+    .email-container { width: 100% !important; }
+    .fluid-padding { padding-left: 20px !important; padding-right: 20px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background-color:#F4F6F5;">
+  <!-- Préheader : texte d'aperçu utilisé par la boîte de réception, invisible à l'ouverture. -->
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;opacity:0;">
+    {% block preheader %}{% endblock %}
+    &#8203;&#847; &#8203;&#847; &#8203;&#847; &#8203;&#847; &#8203;&#847; &#8203;&#847; &#8203;&#847;
+  </div>
+  <center>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#F4F6F5;">
+      <tr>
+        <td align="center" style="padding:24px 16px;">
+          <table role="presentation" class="email-container" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background-color:#ffffff;border-radius:12px;">
+            <!-- En-tête : logo, cliquable vers le site vitrine Senta'a. -->
+            <tr>
+              <td align="center" style="padding:28px 24px 12px;border-radius:12px 12px 0 0;background-color:#ffffff;">
+                <a href="{{ site_url }}" target="_blank" style="text-decoration:none;">
+                  <img src="{{ logo_url }}" width="72" height="70" alt="Senta'a" style="display:block;border:0;">
+                </a>
+              </td>
+            </tr>
+            <!-- Liseré de marque : les deux couleurs du logo, pas de dépendance à l'image pour l'identité visuelle si elle est bloquée. -->
+            <tr>
+              <td style="line-height:0;font-size:0;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                  <td width="50%" height="4" style="background-color:#A5CB41;line-height:4px;font-size:4px;">&nbsp;</td>
+                  <td width="50%" height="4" style="background-color:#5FA5C8;line-height:4px;font-size:4px;">&nbsp;</td>
+                </tr></table>
+              </td>
+            </tr>
+            <!-- Corps -->
+            <tr>
+              <td class="fluid-padding" style="padding:28px 32px 8px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.6;color:#22282B;">
+                {% block content %}{% endblock %}
+              </td>
+            </tr>
+            <!-- Pied de page -->
+            <tr>
+              <td class="fluid-padding" style="padding:24px 32px 28px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.6;color:#8A9299;border-top:1px solid #ECEFEC;">
+                {% block footer %}
+                <p style="margin:0 0 4px;">Senta'a — {{ company_postal_address }}</p>
+                <p style="margin:0;">Vous recevez cet email car vous avez un compte Senta'a.</p>
+                {% endblock %}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+</html>

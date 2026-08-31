@@ -3,6 +3,7 @@ from datetime import timedelta
 
 from celery import shared_task
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Count
 from django.db.models import Q
 from django.utils import timezone
@@ -15,9 +16,31 @@ from notifications.emails import send_application_reminder
 from notifications.emails import send_newsletter
 from notifications.emails import send_payment_reminder
 from notifications.emails import send_reception_reminder
+from notifications.services.push import send_push
 from users.models import User
 
 logger = logging.getLogger(__name__)
+
+
+@shared_task
+def send_push_notification_task(user_id, title, body, data=None):
+    """Point d'entrée unique pour l'envoi d'un push.
+
+    Le service `notifications.services.push.send_push` ne doit jamais être appelé
+    directement de façon synchrone (voir .claude/rules/push-notifications.md) : tout
+    déclenchement passe par `.delay(...)` sur cette tâche, idéalement depuis
+    `transaction.on_commit(...)` pour ne jamais notifier avant que la transaction métier ne
+    soit validée en base.
+    """
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        logger.warning(
+            "send_push_notification_task: utilisateur %s introuvable ou inactif",
+            user_id,
+        )
+        return 0
+    return send_push(user, title, body, data=data)
 
 
 @shared_task
@@ -37,6 +60,15 @@ def check_pending_escrow_payments():
             continue
         order.payment_reminder_sent_at = timezone.now()
         order.save(update_fields=["payment_reminder_sent_at"])
+        # En plus de l'email existant, jamais à la place (voir /push-reminders-integration).
+        transaction.on_commit(
+            lambda order=order: send_push_notification_task.delay(
+                user_id=order.buyer_id,
+                title="Rappel de paiement",
+                body="Ta commande est en attente de paiement",
+                data={"type": "order", "id": str(order.id)},
+            )
+        )
         count += 1
     return count
 
@@ -63,6 +95,15 @@ def check_pending_reception_confirmations():
             continue
         order.reception_reminder_sent_at = timezone.now()
         order.save(update_fields=["reception_reminder_sent_at"])
+        # En plus de l'email existant, jamais à la place (voir /push-reminders-integration).
+        transaction.on_commit(
+            lambda order=order: send_push_notification_task.delay(
+                user_id=order.buyer_id,
+                title="Rappel de réception",
+                body="Confirme la réception de ta commande",
+                data={"type": "order", "id": str(order.id)},
+            )
+        )
         count += 1
     return count
 
@@ -103,6 +144,18 @@ def check_pending_job_applications():
             reminder_sent_at__isnull=True,
             applied_at__lt=threshold,
         ).update(reminder_sent_at=timezone.now())
+        # En plus de l'email existant, jamais à la place (voir /push-reminders-integration).
+        # Rappel agrégé au niveau de l'offre (plusieurs candidatures possibles) : le
+        # destinataire est le recruteur, pas un candidat — type "job_offer", pas
+        # "job_application" (réservé aux événements liés à une candidature précise).
+        transaction.on_commit(
+            lambda job_offer=job_offer: send_push_notification_task.delay(
+                user_id=job_offer.recruiter_id,
+                title="Candidatures en attente",
+                body=f"Candidatures en attente pour {job_offer.title}",
+                data={"type": "job_offer", "id": str(job_offer.id)},
+            )
+        )
         count += 1
     return count
 

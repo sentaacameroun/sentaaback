@@ -1,3 +1,10 @@
-<p>Bonjour {{ buyer.first_name }},</p>
-<p>Votre commande <strong>{{ order.listing.title }}</strong> a été expédiée. Pensez à confirmer la réception dans l'application dès que vous l'avez reçue, afin que les fonds soient libérés au vendeur.</p>
-<p>— L'équipe Senta'a</p>
+{% extends "emails/base_email.html" %}
+
+{% block title %}Confirmez la réception — Senta'a{% endblock %}
+{% block preheader %}Confirmez la réception de "{{ order.listing.title }}" pour libérer le paiement au vendeur.{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Bonjour {{ buyer.first_name }},</p>
+<p style="margin:0 0 16px;">Votre commande <strong>{{ order.listing.title }}</strong> a été livrée. Confirmez la réception dans l'application dès que possible, afin que les fonds soient libérés au vendeur.</p>
+<p style="margin:0;">— L'équipe Senta'a</p>
+{% endblock %}

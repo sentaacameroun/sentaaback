@@ -1,0 +1,7 @@
+{% extends "emails/base_email.txt" %}
+{% block content %}Bonjour {{ buyer.first_name }},
+
+Votre commande "{{ order.listing.title }}" a été livrée. Confirmez la réception dans
+l'application dès que possible, afin que les fonds soient libérés au vendeur.
+
+— L'équipe Senta'a{% endblock %}

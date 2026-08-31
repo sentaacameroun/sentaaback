@@ -70,6 +70,16 @@ class RegisterView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+@extend_schema(
+    summary="Vérification du code OTP pour l'inscription",
+    request=OTPRequestSerializer,
+    responses={
+        200: UserSerializer,
+        400: OpenApiResponse(description="Code invalide ou expiré"),
+        404: OpenApiResponse(description="Utilisateur non trouvé"),
+    },
+    tags=["Authentification"],
+)
 class LoginOTPRequestView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
