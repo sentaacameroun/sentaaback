@@ -148,9 +148,9 @@ class MobileMoneyWebhookView(APIView):
             logger.warning("Webhook NotchPay rejeté : signature absente ou invalide")
             return Response(status=401)
 
-        reference = request.data.get("reference") or request.data.get(
-            "external_reference"
-        )
+        reference = request.data.get("data", {}).get(
+            "merchant_reference"
+        ) or request.data.get("external_reference")
         if not reference:
             return Response(status=400)
 
