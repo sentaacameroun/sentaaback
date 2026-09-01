@@ -121,6 +121,12 @@ services:
       - media_volume:/app/media
     depends_on:
       web: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A back_sentaa inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     deploy:
       resources:
         limits: { cpus: '0.5', memory: 256M }
@@ -140,6 +146,8 @@ services:
       - celery_beat_data:/data
     depends_on:
       web: { condition: service_healthy }
+    healthcheck:
+      disable: true
     deploy:
       resources:
         limits: { cpus: '0.1', memory: 96M }
@@ -159,6 +167,8 @@ services:
       - "127.0.0.1:5556:5555"
     depends_on:
       redis: { condition: service_healthy }
+    healthcheck:
+      disable: true
     deploy:
       resources:
         limits: { cpus: '0.1', memory: 96M }

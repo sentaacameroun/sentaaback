@@ -130,6 +130,18 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
+# Sans ça (défaut Celery), une tâche est acquittée AVANT exécution : si le worker meurt
+# pendant le traitement (OOM-kill, déploiement, `docker stop`), la tâche est perdue
+# silencieusement — jamais retentée, aucune trace. Avec acks_late, elle n'est acquittée
+# qu'après succès/échec, et redistribuée si le worker disparaît en cours de route
+# (`task_reject_on_worker_lost` couvre le cas où le worker part sans même relever
+# d'exception, ex. SIGKILL). Toutes les tâches de `notifications/tasks.py` tolèrent le
+# doublon que ça peut introduire (au pire un push ou un rappel renvoyé deux fois) — sauf
+# `send_weekly_newsletter`, qui n'a pas de garde d'idempotence par destinataire : une
+# redistribution après exécution partielle peut renvoyer la newsletter à des abonnés déjà
+# notifiés (nuisance, pas une perte de données).
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
 
 CELERY_BEAT_SCHEDULE = {
     "check-pending-escrow-payments": {
