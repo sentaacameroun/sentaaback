@@ -4,6 +4,7 @@ from unittest.mock import patch
 from channels.db import database_sync_to_async
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
+from django.test import override_settings
 from django.test import TransactionTestCase
 from django.urls import re_path
 from rest_framework.test import APIClient
@@ -17,11 +18,14 @@ from chat.middleware import JWTAuthMiddleware
 from escrow.models import Order
 from escrow.models import PaymentTransaction
 from escrow.services.delivery_hooks import on_order_paid
+from escrow.services.providers import ProviderResult
+from escrow.services.providers import STATUS_PENDING
 from marketplace.models import Category
 from marketplace.models import Listing
 from users.models import User
 
 
+@override_settings(PAYMENT_PROVIDER="notchpay")
 class LogisticsTests(APITestCase):
     def setUp(self):
         self.buyer = User.objects.create_user(
@@ -263,7 +267,7 @@ class LogisticsTests(APITestCase):
         delivery.refresh_from_db()
         return delivery
 
-    @patch("escrow.services.payouts.NotchPayClient.initialize_transfer")
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_transfer")
     def test_confirm_delivery_marks_delivered_and_pays_courier_only(
         self, mock_transfer
     ):
@@ -271,7 +275,11 @@ class LogisticsTests(APITestCase):
         # shipped → delivered et paie le coursier, mais NE libère PAS les fonds au vendeur
         # (seule la confirmation acheteur le fait). Correctif du double reversement
         # (BLOQUANT #1) : le coursier ne clôture plus la commande.
-        mock_transfer.return_value = {"transaction": {"reference": "courier-ref"}}
+        mock_transfer.return_value = ProviderResult(
+            provider_reference="courier-ref",
+            status=STATUS_PENDING,
+            raw={"transaction": {"reference": "courier-ref"}},
+        )
         delivery = Delivery.objects.create(
             order=self.order, courier=self.courier, status="assigned"
         )
@@ -301,7 +309,7 @@ class LogisticsTests(APITestCase):
             ).exists()
         )
 
-    @patch("escrow.services.payouts.NotchPayClient.initialize_transfer")
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_transfer")
     def test_two_step_closure_courier_then_buyer_releases_once(self, mock_transfer):
         # Bout-en-bout : le coursier livre (delivered) puis l'acheteur confirme (completed +
         # un seul virement vendeur). Vérifie qu'un unique reversement `withdraw` est créé —
@@ -309,8 +317,16 @@ class LogisticsTests(APITestCase):
         # Références distinctes par appel : le payout coursier et le reversement vendeur
         # créent chacun une PaymentTransaction dont l'external_ref est unique.
         mock_transfer.side_effect = [
-            {"transaction": {"reference": "courier-ref"}},
-            {"transaction": {"reference": "seller-ref"}},
+            ProviderResult(
+                provider_reference="courier-ref",
+                status=STATUS_PENDING,
+                raw={"transaction": {"reference": "courier-ref"}},
+            ),
+            ProviderResult(
+                provider_reference="seller-ref",
+                status=STATUS_PENDING,
+                raw={"transaction": {"reference": "seller-ref"}},
+            ),
         ]
         delivery = Delivery.objects.create(
             order=self.order, courier=self.courier, status="assigned"

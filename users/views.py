@@ -118,6 +118,16 @@ class LoginOTPRequestView(APIView):
         return Response(serializer.errors, status=400)
 
 
+@extend_schema(
+    summary="Vérification du code OTP pour la connexion",
+    request=OTPVerifySerializer,
+    responses={
+        200: UserSerializer,
+        400: OpenApiResponse(description="Code invalide ou expiré"),
+        404: OpenApiResponse(description="Utilisateur non trouvé"),
+    },
+    tags=["Authentification"],
+)
 class LoginOTPVerifyView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]

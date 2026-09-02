@@ -148,11 +148,196 @@ Note de scope : task 2 impose l'ajout de `rest_framework_simplejwt.token_blackli
 mais explicitement requise par la commande. Aucune migration à générer :
 `token_blacklist` embarque les siennes (appliquées par `migrate`).
 
+## PR 7 — Intégration KPay & architecture multi-provider
+Statut : ☑ terminé (2026-09-02) — `pytest` nu = **180 passed** ; `ruff check .` clean ;
+`black --check` clean (fichiers touchés) ; `manage.py makemigrations --check` = no changes ;
+revue `escrow-reviewer` demandée sur ce diff (voir verdict avant de cocher définitivement en
+CI/déploiement).
+
+Demande directe du développeur (hors cycle `/refactor-prX`, pas de commande dédiée) : les
+webhooks NotchPay en prod étaient peu fiables (voir commits `cc52484`/`1abd301`, forme du
+payload webhook corrigée mais tests jamais réalignés — 4 tests `escrow/tests.py` étaient
+rouges avant cette PR, corrigés ici) ; KPay (https://kpay.site/documentation) devient
+l'intégrateur **principal**, NotchPay est conservé comme fournisseur secondaire, sous une
+véritable architecture multi-provider (ce que PR 4 avait tranché en sens inverse en
+supprimant le code mort `providers/`/`kpay_client`/`moneyfusion_client` — voir question 1
+ci-dessous, rouverte).
+
+- [x] **`escrow/services/providers/`** : interface commune `PaymentProviderClient` (ABC),
+      résultat normalisé `ProviderResult` (statuts `pending`/`successful`/`failed`, alignés
+      sur `PaymentTransaction.STATUS_CHOICES`), exception commune `PaymentProviderError`.
+      `NotchPayClient` déplacé depuis `escrow/services/notchpay_client.py` (comportement HTTP
+      inchangé, seule la sortie est désormais normalisée). Nouveau `KPayClient` (auth
+      `X-API-Key`/`X-Secret-Key`, `/api/v1/payments/init`+`/{id}`,
+      `/api/v1/payments/withdraw`+`/{id}`, mapping canal `mtn`/`orange` →
+      `MTN_MOMO_CMR`/`ORANGE_CMR` — Sentaa n'opère qu'au Cameroun).
+- [x] **Sélection par variable d'env** : `PAYMENT_PROVIDER` (`settings.py`, défaut `"kpay"`),
+      factory `get_payment_client(provider_name=None)`. `escrow/views.py`
+      (`initiate_payment`), `escrow/services/payouts.py` (`release_escrow_funds`,
+      `pay_courier_for_delivery`) l'utilisent désormais au lieu d'instancier `NotchPayClient()`
+      en dur.
+- [x] **`PaymentTransaction.provider` enfin peuplé** (le champ existait déjà, choix
+      `notchpay`/`kpay`/`moneyfusion`, mais n'était jamais écrit) — chaque transaction garde
+      le fournisseur qui l'a réellement traitée. Ajouté à `escrow/admin.py`
+      (list_display/list_filter).
+- [x] **Réconciliation provider-aware** (`escrow/tasks.py::_reconcile_pending`) :
+      `get_payment_client(txn.provider or None)` appelé PAR TRANSACTION dans la boucle (pas un
+      seul client partagé pour tout le batch) — sinon changer `PAYMENT_PROVIDER` casserait la
+      réconciliation des reversements déjà en cours chez l'ancien fournisseur (interrogerait
+      l'API KPay avec une référence NotchPay, ou l'inverse). Ligne `provider=""` (legacy,
+      avant peuplement du champ) retombe sur le fournisseur actif. Testé explicitement
+      (`PaymentReconciliationMultiProviderTests`).
+- [x] **Webhook KPay** (`/kpay-webhook/`, `KPayWebhookView`) : signature HMAC-SHA256
+      (`X-KPAY-Signature` / `KPAY_WEBHOOK_SECRET`, même politique de repli que NotchPay si
+      secret absent). Ne traite que les événements `payment.*` — les événements `payout.*`/
+      `refund.*` (KPay en envoie, contrairement à NotchPay) ne sont **pas** consommés ici,
+      volontairement : la convergence de statut des reversements reste assurée exclusivement
+      par la réconciliation Celery (`escrow/tasks.py`), pour ne pas dupliquer le chemin
+      d'écriture des statuts de payout. **Suivi possible** si la latence de 15 min de la
+      réconciliation devient un problème produit : consommer aussi `payout.completed/failed`
+      côté webhook, en le faisant converger vers le même code que la réconciliation (jamais un
+      second chemin distinct).
+- [x] **`_CollectWebhookView`** : base commune factorisant la clôture webhook (re-vérification
+      du statut auprès du fournisseur, puis transition `paid_escrow`) entre
+      `MobileMoneyWebhookView` (NotchPay) et `KPayWebhookView` — un seul endroit écrit cette
+      transition depuis un webhook, quel que soit le fournisseur. Chaque vue instancie
+      **explicitement** son propre client (`NotchPayClient()`/`KPayClient()`), jamais via
+      `get_payment_client()` : un webhook est par construction propre à UN fournisseur (URL de
+      callback configurée côté dashboard fournisseur), indépendamment de `PAYMENT_PROVIDER`.
+- [x] **Idempotence KPay en plus de la contrainte unique existante (règle #2)** :
+      `initialize_transfer` reçoit désormais la clé d'idempotence Senta'a
+      (`release:{order.id}`/`courier_payout:{delivery.id}`) et la transmet en `externalId` à
+      KPay quand elle est fournie (`NotchPayClient` accepte le même paramètre mais ne l'utilise
+      pas encore côté payload — comportement NotchPay volontairement inchangé, hors scope).
+- [x] **Faille croisée entre fournisseurs corrigée** (trouvée par la revue `escrow-reviewer`
+      sur ce diff). `_CollectWebhookView._process` rejette désormais (log + 200 idempotent,
+      sans appeler le fournisseur) tout webhook dont `txn.provider` est renseigné et diffère
+      du fournisseur de l'endpoint appelé (`client.name`) — sans ce garde-fou, une référence
+      provider valide chez KPay pouvait cibler une transaction traitée par NotchPay (et
+      inversement). `txn.provider` vide (lignes créées avant l'ajout du champ) ne bloque pas.
+      Testé (`test_webhook_ignores_transaction_owned_by_another_provider`, sur les deux
+      endpoints).
+- [x] **Faille de rejeu inter-transactions corrigée** (même revue, point plus sérieux —
+      voir l'ancienne section "⚠️ non corrigée" ci-dessous, résolue depuis). Le vrai problème :
+      `_process` faisait confiance à `provider_reference` tel que fourni PAR LE CORPS de la
+      requête webhook (payload non authentifié fonctionnellement, endpoint `AllowAny`), sans
+      jamais vérifier qu'il correspondait à la transaction visée par `reference` — un
+      attaquant pouvait rejouer le `provider_reference` d'un paiement RÉEL et complété chez
+      lui (même minime, même sur une autre commande — potentiellement la sienne, pas besoin de
+      cibler un tiers) contre le `reference` d'une commande bien plus chère, jamais payée, et
+      la faire créditer `paid_escrow`. Piste initialement envisagée (comparer le champ que
+      le fournisseur associe lui-même à `provider_reference` dans sa réponse `verify_payment`)
+      abandonnée : deux sources sur le format exact de la réponse NotchPay se contredisaient,
+      et un mauvais nom de champ aurait rejeté silencieusement tous les paiements réels.
+      **Solution retenue (bien plus robuste, suggérée par le développeur)** : stocker
+      `provider_reference` (celle attribuée par le fournisseur À LA CRÉATION du paiement,
+      `initiate_payment` — déjà extraite par les clients mais jusqu'ici jamais persistée,
+      champ `PaymentTransaction.provider_reference` existant mais mort) puis, dans `_process`,
+      comparer AVANT tout appel réseau le `provider_reference` reçu dans le webhook à celui
+      stocké à la création. Ne dépend d'aucune connaissance du format de réponse d'un
+      fournisseur tiers — uniquement de données que Senta'a contrôle. Vide (transactions
+      créées avant ce correctif) ne bloque pas, la re-vérification live reste alors la seule
+      mitigation. Testé (`test_webhook_rejects_replayed_provider_reference` +
+      `test_webhook_accepts_matching_provider_reference`, sur les deux endpoints).
+- [x] **Réponse `initiate_payment` réduite** (à l'origine de la découverte du point
+      ci-dessus) : ne renvoie plus `result.raw` (objet brut du fournisseur, pouvait exposer
+      des identifiants internes) au frontend — seulement `reference`, `status`, `payment_flow`
+      et `checkout_url` quand il existe.
+- [x] **`payment_flow` explicite** (suite à une question directe du développeur : "comment le
+      front va savoir qu'il faut ouvrir un lien ou gérer l'USSD ?"). Avec deux fournisseurs
+      aux comportements différents (NotchPay : toujours une page hébergée puisqu'aucun canal
+      n'est envoyé dans le payload de création ; KPay : toujours un push USSD direct puisque
+      le canal est toujours fourni), deviner le flux à partir de la seule présence de
+      `checkout_url` aurait été implicite et fragile face à un futur 3e mode. Ajout de
+      `ProviderResult.payment_flow` (`FLOW_REDIRECT`/`FLOW_USSD`,
+      `escrow/services/providers/base.py`), toujours présent dans la réponse
+      `initiate_payment` — c'est ce champ que le frontend doit tester, jamais la présence de
+      `checkout_url`. Champ NotchPay confirmé par le développeur : `transaction
+      .authorization_url` (pas `checkout_url` comme supposé initialement — corrigé dans
+      `notchpay.py`).
+- [x] **Bug webhook NotchPay corrigé dans les tests** (pas dans le code métier, déjà bon sur
+      `dev`) : 4 tests (`test_webhook_marks_order_paid_on_success`,
+      `test_webhook_ignores_unconfirmed_status`, `test_webhook_is_idempotent_on_duplicate_calls`,
+      `test_webhook_accepts_valid_signature`) postaient un payload à plat
+      (`{"reference": ...}`) alors que la vue (corrigée par `cc52484`/`1abd301`, avant cette
+      PR) attend la forme réelle NotchPay, imbriquée sous `"data"`. Réalignés sur la vraie
+      forme du payload.
+
+Fichiers touchés hors du périmètre `escrow/services/providers/` (nécessaires, signalés par
+transparence) : `escrow/views.py`, `escrow/urls.py`, `escrow/services/payouts.py`,
+`escrow/tasks.py`, `escrow/admin.py`, `back_sentaa/settings.py`, `.env.example`,
+`escrow/tests.py`, `logistics/tests.py` (patch targets déplacés vers
+`escrow.services.providers.notchpay.NotchPayClient`, mocks renvoyant désormais des
+`ProviderResult` au lieu de dicts bruts — contrat normalisé — `@override_settings
+(PAYMENT_PROVIDER="notchpay")` ajouté aux classes historiques pour rester des tests de
+régression NotchPay explicites).
+
+Non fait, volontairement hors scope :
+- `MoneyFusionClient` (3e choix déjà présent dans `PaymentTransaction.PROVIDERS`) : pas
+  demandé, pas implémenté — le choix `"moneyfusion"` reste un slot inutilisé.
+- Reformatage du numéro de téléphone par fournisseur (KPay documente `"237653456789"` sans
+  `+` ; le code existant passe `phone_number`/`str(user.phone_number)` tel quel, sans
+  transformation, y compris pour NotchPay déjà en prod) — non touché, comportement identique
+  à l'existant.
+
+**Revue de suivi (`escrow-reviewer`) sur ce correctif de rejeu : APPROUVÉ.** Vérifié
+spécifiquement : le garde-fou ferme bien le scénario décrit (aucun contournement trouvé, y
+compris via une tentative d'auto-initiation sur la commande cible — bloquée en amont par la
+permission objet existante) ; il est bien placé avant tout appel réseau ; les tests ajoutés
+échoueraient effectivement sans le correctif (vérifié) ; aucun usage existant du repo ne
+dépend de l'ancienne forme de réponse `initiate_payment`. Point mineur relevé et corrigé dans
+la foulée : `initiate_payment` loggue désormais un `warning` explicite quand la réponse
+fournisseur ne contient pas de `provider_reference` (dégradation silencieuse du garde-fou
+sinon, pour cette transaction précise) — testé
+(`test_initiate_payment_logs_warning_when_provider_reference_missing`).
+
+### Mode GATEWAY KPay (page hébergée avec choix cartes/PayPal)
+
+Demande directe du développeur : le frontend doit pouvoir choisir, même quand KPay est le
+fournisseur actif, un paiement par page hébergée (mode GATEWAY KPay) plutôt que le push USSD
+direct — pour que les cartes bancaires (Visa/Mastercard) et PayPal apparaissent en plus des
+choix Mobile Money, comme documenté sur https://kpay.site/documentation/cartes-paypal.
+
+- [x] `InitiatePaymentSerializer` : `phone_number`/`channel` deviennent optionnels — fournis
+      ensemble → paiement direct (push USSD chez KPay) ; omis ensemble → mode page hébergée,
+      `return_url` devient alors obligatoire (fournie par le **frontend**, décision explicite
+      du développeur : deep link app ou page web, propre à son schéma — pas d'URL fixe
+      côté backend). Combinaison partielle (l'un sans l'autre) rejetée (400).
+- [x] `KPayClient.initialize_payment` : `channel` fourni → mode USSD inchangé (`provider` +
+      `phoneNumber`) ; `channel` absent → mode GATEWAY (`returnUrl`/`cancelUrl` à la place,
+      garde-fou `KPayError` si `return_url` manquant — défense en profondeur, la validation
+      normale se fait dans le serializer). Réponse GATEWAY : `gatewayUrl` repris comme
+      `checkout_url` (nom de champ confirmé via https://kpay.site/documentation/paiements et
+      /cartes-paypal, cohérents entre eux).
+- [x] `NotchPayClient.initialize_payment` : accepte les mêmes paramètres pour la conformité
+      d'interface (toujours ignorés — un seul mode, déjà page hébergée) ; `phone` devient
+      optionnel côté payload (`customer` omis si absent, au lieu d'envoyer une valeur nulle
+      non vérifiée).
+- [x] **Repli de canal pour le reversement** (bug trouvé en creusant cette fonctionnalité,
+      pas signalé par le développeur) : `release_escrow_funds`/`pay_courier_for_delivery`
+      (`escrow/services/payouts.py`) réutilisaient `last_collect.channel` tel quel pour le
+      reversement — un `channel` vide (collecte par carte/PayPal, sans opérateur Mobile Money)
+      aurait fait échouer *indéfiniment* le reversement chez KPay (`KeyError` →
+      `KPayError` à chaque tentative de réconciliation, jamais résolu). Repli sur le même
+      défaut que l'absence totale de collecte (`PaymentTransaction.CHANNELS[0][0]`) — un choix
+      arbitraire assumé (aucun moyen fiable de connaître l'opérateur réel du vendeur pour un
+      acheteur ayant payé par carte), documenté en code ; rejoint le circuit existant de
+      reversements bornés + intervention manuelle en cas d'échec, pas une nouvelle classe de
+      bug. Testé (`test_release_escrow_funds_falls_back_when_collect_channel_blank`,
+      `test_pay_courier_falls_back_when_collect_channel_blank`).
+- [x] `ProviderResult`/réponse `initiate_payment` : nouveau champ `payment_flow`
+      (`FLOW_REDIRECT`/`FLOW_USSD`) déjà couvert plus haut, réutilisé ici pour le mode GATEWAY.
+
+Non fait, volontairement hors scope : NotchPay n'a pas de second mode dans ce repo (toujours
+page hébergée) — aucune tentative de lui ajouter un mode direct/USSD, non demandé.
+
 ## Questions ouvertes restantes
 Voir `docs/AUDIT_BACKEND.md` §9. Un agent ne doit jamais trancher ces
 questions seul — elles doivent être posées explicitement au développeur.
 
-1. ~~Paiement multi-fournisseurs~~ — **tranché en PR 4** (code mort supprimé).
+1. ~~Paiement multi-fournisseurs~~ — tranché en PR 4 (code mort supprimé), **rouvert et
+   implémenté en PR 7** (KPay intégrateur principal, NotchPay secondaire, sélection via
+   `PAYMENT_PROVIDER`) suite à un problème de fiabilité des webhooks NotchPay en prod.
 2. ~~Clôture de commande~~ — **tranché en PR 3** (deux endpoints, un seul
    chemin de libération des fonds).
 3. ~~`shipping_fee`~~ — **tranché en PR 1** (calcul serveur).

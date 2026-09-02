@@ -40,16 +40,22 @@ class PaymentTransactionAdmin(admin.ModelAdmin):
         "order",
         "amount",
         "transaction_type",
+        "provider",
         "channel",
         "status",
         "external_ref",
         "created_at",
     )
-    list_filter = ("transaction_type", "status", "channel")
+    # `provider` : fournisseur ayant réellement traité la transaction (architecture
+    # multi-provider, voir escrow/services/providers/) — filtrable pour distinguer les
+    # transactions NotchPay des transactions KPay, utile lors d'un changement de
+    # PAYMENT_PROVIDER.
+    list_filter = ("transaction_type", "status", "provider", "channel")
     readonly_fields = (
         "order",
         "amount",
         "transaction_type",
+        "provider",
         "channel",
         "phone_number",
         "status",

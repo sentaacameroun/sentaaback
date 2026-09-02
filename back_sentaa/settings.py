@@ -432,7 +432,29 @@ if not DEBUG:
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
 
-# NotchPay (agrégateur Mobile Money : MTN MoMo + Orange Money Cameroun)
+# Fournisseur Mobile Money actif (architecture multi-provider, voir
+# escrow/services/providers/) : "kpay" (intégrateur principal) ou "notchpay" (fournisseur
+# historique, conservé — ses webhooks avaient un problème de fiabilité en prod). Un seul actif
+# à la fois pour toute NOUVELLE opération ; les transactions déjà en cours gardent le
+# fournisseur qui les a traitées (`PaymentTransaction.provider`), y compris pour la
+# réconciliation (escrow/tasks.py) — changer cette variable n'affecte pas les paiements déjà
+# initiés avec l'autre fournisseur.
+PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "kpay")
+
+# KPay (agrégateur Mobile Money multi-pays — intégrateur principal, voir PAYMENT_PROVIDER
+# ci-dessus). Clés générées depuis l'écran "Applications" du dashboard KPay.
+# https://kpay.site/documentation
+KPAY_BASE_URL = os.getenv("KPAY_BASE_URL", "https://admin.kpay.site")
+KPAY_API_KEY = os.getenv("KPAY_API_KEY", "")
+KPAY_SECRET_KEY = os.getenv("KPAY_SECRET_KEY", "")
+# Secret HMAC-SHA256 vérifiant la signature `X-KPAY-Signature` du webhook (escrow/views.py),
+# configuré dans le dashboard KPay. Vide = pas de vérification de signature (dev/tests) ; la
+# re-vérification via l'API (verify_payment) reste la mitigation — même politique que
+# NOTCHPAY_WEBHOOK_HASH ci-dessous.
+KPAY_WEBHOOK_SECRET = os.getenv("KPAY_WEBHOOK_SECRET", "")
+
+# NotchPay (agrégateur Mobile Money : MTN MoMo + Orange Money Cameroun) — fournisseur
+# historique, toujours supporté (voir PAYMENT_PROVIDER).
 NOTCHPAY_BASE_URL = os.getenv("NOTCHPAY_BASE_URL", "https://api.notchpay.co")
 NOTCHPAY_PUBLIC_KEY = os.getenv("NOTCHPAY_PUBLIC_KEY", "")
 NOTCHPAY_PRIVATE_KEY = os.getenv("NOTCHPAY_PRIVATE_KEY", "")

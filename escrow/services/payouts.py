@@ -4,8 +4,8 @@ from django.db import IntegrityError
 from django.db import transaction
 
 from escrow.models import PaymentTransaction
-from escrow.services.notchpay_client import NotchPayClient
-from escrow.services.notchpay_client import NotchPayError
+from escrow.services.providers import get_payment_client
+from escrow.services.providers import PaymentProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -38,25 +38,32 @@ def release_escrow_funds(order, idempotency_key=None):
         .order_by("-created_at")
         .first()
     )
+    # `last_collect.channel` peut être vide : un paiement collecté en mode page hébergée
+    # KPay par carte/PayPal (voir escrow/services/providers/kpay.py, InitiatePaymentSerializer)
+    # n'a pas d'opérateur Mobile Money associé. On retombe alors sur le même défaut que
+    # l'absence totale de collecte — un choix arbitraire (pas de moyen fiable de connaître
+    # l'opérateur du vendeur) qui peut faire échouer ce reversement précis ; il rejoint alors
+    # le circuit existant de reversements `failed` bornés + intervention manuelle
+    # (escrow/tasks.py::reconcile_pending_payouts), pas une régression.
     channel = (
-        last_collect.channel if last_collect else PaymentTransaction.CHANNELS[0][0]
+        last_collect.channel
+        if last_collect and last_collect.channel
+        else PaymentTransaction.CHANNELS[0][0]
     )
     phone_number = (
         last_collect.phone_number if last_collect else str(seller.phone_number)
     )
 
-    client = NotchPayClient()
+    client = get_payment_client()
     try:
         result = client.initialize_transfer(
             amount=payout_amount,
             account_number=str(seller.phone_number),
             channel=channel,
             currency="XAF",
+            reference=idempotency_key,
             description=f"Reversement vendeur commande {order.id}",
         )
-        transfer_ref = None
-        if isinstance(result, dict):
-            transfer_ref = (result.get("transaction") or {}).get("reference")
         try:
             # Savepoint (`atomic`) autour du create : si un appel concurrent a déjà
             # enregistré ce reversement, la violation de contrainte unique ne casse que le
@@ -65,13 +72,14 @@ def release_escrow_funds(order, idempotency_key=None):
                 PaymentTransaction.objects.create(
                     order=order,
                     transaction_type="withdraw",
-                    external_ref=transfer_ref,
+                    external_ref=result.provider_reference,
                     idempotency_key=idempotency_key,
+                    provider=client.name,
                     amount=payout_amount,
                     channel=channel,
                     phone_number=phone_number,
                     status="pending",
-                    raw_response=result,
+                    raw_response=result.raw,
                 )
         except IntegrityError:
             # La contrainte unique a fait son travail : on n'enregistre pas de doublon.
@@ -80,9 +88,11 @@ def release_escrow_funds(order, idempotency_key=None):
                 order.id,
                 idempotency_key,
             )
-    except NotchPayError:
+    except PaymentProviderError:
         logger.exception(
-            "Échec du reversement vendeur pour order %s ; réconciliation manuelle nécessaire",
+            "Échec du reversement vendeur (%s) pour order %s ; réconciliation manuelle "
+            "nécessaire",
+            client.name,
             order.id,
         )
         # Ligne d'échec créée SANS idempotency_key : un reversement échoué ne doit pas
@@ -94,6 +104,7 @@ def release_escrow_funds(order, idempotency_key=None):
         PaymentTransaction.objects.create(
             order=order,
             transaction_type="withdraw",
+            provider=client.name,
             amount=payout_amount,
             channel=channel,
             phone_number=phone_number,
@@ -106,10 +117,10 @@ def pay_courier_for_delivery(delivery):
     """
     Reverse order.shipping_fee au coursier assigné. Déplacé depuis
     `logistics.views.DeliveryViewSet._payout_courier` vers `escrow.services` : `logistics`
-    importe déjà `escrow.services.notchpay_client` en top-level, alors qu'`escrow` ne
-    référence `logistics` que via un import différé (voir `delivery_hooks.on_order_paid`) —
-    ce module partagé doit donc vivre côté escrow pour respecter ce sens d'import et éviter
-    tout risque de cycle.
+    importe déjà `escrow.services.payouts` (donc `escrow.services.providers`) en top-level,
+    alors qu'`escrow` ne référence `logistics` que via un import différé (voir
+    `delivery_hooks.on_order_paid`) — ce module partagé doit donc vivre côté escrow pour
+    respecter ce sens d'import et éviter tout risque de cycle.
 
     Idempotent (PR 5, point B tracké par escrow-reviewer en PR 3) : la ligne de payout porte
     `idempotency_key = courier_payout:{delivery.id}`, unique en base — un double appel ne peut
@@ -141,22 +152,25 @@ def pay_courier_for_delivery(delivery):
         .order_by("-created_at")
         .first()
     )
+    # Voir le commentaire équivalent dans release_escrow_funds ci-dessus : `channel` vide
+    # (collecte par carte/PayPal via la page hébergée KPay) retombe sur le même défaut que
+    # l'absence de collecte.
     channel = (
-        last_collect.channel if last_collect else PaymentTransaction.CHANNELS[0][0]
+        last_collect.channel
+        if last_collect and last_collect.channel
+        else PaymentTransaction.CHANNELS[0][0]
     )
 
-    client = NotchPayClient()
+    client = get_payment_client()
     try:
         result = client.initialize_transfer(
             amount=payout_amount,
             account_number=str(courier.phone_number),
             channel=channel,
             currency="XAF",
+            reference=idempotency_key,
             description=f"Reversement livreur commande {order.id}",
         )
-        transfer_ref = None
-        if isinstance(result, dict):
-            transfer_ref = (result.get("transaction") or {}).get("reference")
         try:
             # Savepoint autour du create : un appel concurrent portant la même clé casse le
             # savepoint (violation d'unicité) sans casser la transaction englobante.
@@ -164,13 +178,14 @@ def pay_courier_for_delivery(delivery):
                 PaymentTransaction.objects.create(
                     order=order,
                     transaction_type="courier_payout",
-                    external_ref=transfer_ref,
+                    external_ref=result.provider_reference,
                     idempotency_key=idempotency_key,
+                    provider=client.name,
                     amount=payout_amount,
                     channel=channel,
                     phone_number=str(courier.phone_number),
                     status="pending",
-                    raw_response=result,
+                    raw_response=result.raw,
                 )
         except IntegrityError:
             logger.warning(
@@ -178,9 +193,10 @@ def pay_courier_for_delivery(delivery):
                 delivery.id,
                 idempotency_key,
             )
-    except NotchPayError:
+    except PaymentProviderError:
         logger.exception(
-            "Échec du reversement livreur pour delivery %s ; réconciliation nécessaire",
+            "Échec du reversement livreur (%s) pour delivery %s ; réconciliation nécessaire",
+            client.name,
             delivery.id,
         )
         # Ligne d'échec créée SANS idempotency_key : un payout échoué ne doit pas consommer
@@ -191,6 +207,7 @@ def pay_courier_for_delivery(delivery):
         PaymentTransaction.objects.create(
             order=order,
             transaction_type="courier_payout",
+            provider=client.name,
             amount=payout_amount,
             channel=channel,
             phone_number=str(courier.phone_number),

@@ -1,12 +1,15 @@
 """
 Réconciliation des reversements Mobile Money (BLOQUANT #12 de l'audit).
 
-Un transfert NotchPay (`withdraw` vendeur, `courier_payout` livreur) est **asynchrone** :
-`initialize_transfer` renvoie une ligne `pending` et le statut final n'arrive jamais par le
-webhook (celui-ci ne vérifie que les collectes via `/payments/{ref}`). Sans réconciliation, un
-reversement reste `pending` indéfiniment (audit §6.5). Cette tâche Celery planifiée :
+Un transfert Mobile Money (`withdraw` vendeur, `courier_payout` livreur) est **asynchrone**,
+quel que soit le fournisseur (NotchPay, KPay — voir escrow/services/providers/) :
+`initialize_transfer` renvoie une ligne `pending` et le statut final n'arrive pas forcément par
+le webhook. Sans réconciliation, un reversement reste `pending` indéfiniment (audit §6.5).
+Cette tâche Celery planifiée :
 
-  1. resout les reversements `pending` (avec référence fournisseur) via `/transfers/{ref}` ;
+  1. resout les reversements `pending` (avec référence fournisseur) en interrogeant TOUJOURS le
+     fournisseur qui a réellement traité la ligne (`PaymentTransaction.provider`), pas
+     forcément celui actuellement actif (`PAYMENT_PROVIDER` a pu changer entre-temps) ;
   2. re-tente les reversements `failed` jamais initiés (fail-soft), de façon **idempotente**
      et **bornée** (pas de retry infini silencieux) grâce aux clés d'idempotence de PR 3/PR 5.
 
@@ -26,24 +29,16 @@ from django.utils import timezone
 
 from escrow.models import Order
 from escrow.models import PaymentTransaction
-from escrow.services.notchpay_client import NotchPayClient
-from escrow.services.notchpay_client import NotchPayError
 from escrow.services.payouts import pay_courier_for_delivery
 from escrow.services.payouts import release_escrow_funds
+from escrow.services.providers import get_payment_client
+from escrow.services.providers import PaymentProviderError
+from escrow.services.providers import STATUS_FAILED
+from escrow.services.providers import STATUS_SUCCESSFUL
 
 logger = logging.getLogger(__name__)
 
 _PAYOUT_TYPES = ["withdraw", "courier_payout"]
-_SUCCESS_STATUSES = {"complete", "completed", "successful", "success"}
-_FAILURE_STATUSES = {"failed", "canceled", "cancelled", "rejected", "error"}
-
-
-def _extract_transfer_status(result):
-    """Statut normalisé (minuscules) d'une réponse `/transfers/{ref}`, robuste au wrapping."""
-    if not isinstance(result, dict):
-        return ""
-    payload = result.get("transfer") or result.get("transaction") or {}
-    return (payload.get("status") or "").lower()
 
 
 @shared_task
@@ -74,14 +69,21 @@ def _reconcile_pending(threshold, max_attempts):
         reconciliation_attempts__lt=max_attempts,
     )
     resolved = 0
-    client = NotchPayClient()
     for txn in stuck:
+        # Chaque ligne garde le fournisseur qui l'a réellement traitée
+        # (`PaymentTransaction.provider`) : on interroge TOUJOURS ce fournisseur-là, jamais
+        # celui actuellement actif (`PAYMENT_PROVIDER` a pu changer depuis) — sinon on
+        # réconcilierait une référence NotchPay contre l'API KPay (ou l'inverse). Une ligne
+        # sans provider (créée avant l'ajout du champ) retombe sur le fournisseur actif.
+        client = get_payment_client(txn.provider or None)
         try:
             result = client.verify_transfer(txn.external_ref)
-        except NotchPayError:
+        except PaymentProviderError:
             attempts = _bump_attempts(txn.pk)
             logger.warning(
-                "Réconciliation : verify_transfer a échoué pour %s (ref %s, tentative %s/%s)",
+                "Réconciliation : verify_transfer (%s) a échoué pour %s (ref %s, "
+                "tentative %s/%s)",
+                client.name,
                 txn.id,
                 txn.external_ref,
                 attempts,
@@ -97,15 +99,14 @@ def _reconcile_pending(threshold, max_attempts):
                 )
             continue
 
-        provider_status = _extract_transfer_status(result)
         with transaction.atomic():
             locked = PaymentTransaction.objects.select_for_update().get(pk=txn.pk)
             if locked.status != "pending":
                 # Résolu entre-temps par un autre passage : idempotent, on n'y touche plus.
                 continue
             locked.reconciliation_attempts += 1
-            locked.raw_response = result
-            if provider_status in _SUCCESS_STATUSES:
+            locked.raw_response = result.raw
+            if result.status == STATUS_SUCCESSFUL:
                 locked.status = "successful"
                 locked.is_success = True
                 locked.save(
@@ -117,7 +118,7 @@ def _reconcile_pending(threshold, max_attempts):
                     ]
                 )
                 resolved += 1
-            elif provider_status in _FAILURE_STATUSES:
+            elif result.status == STATUS_FAILED:
                 locked.status = "failed"
                 locked.save(
                     update_fields=["status", "raw_response", "reconciliation_attempts"]

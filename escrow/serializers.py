@@ -104,5 +104,38 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class InitiatePaymentSerializer(serializers.Serializer):
-    phone_number = serializers.CharField(max_length=20)
-    channel = serializers.ChoiceField(choices=PaymentTransaction.CHANNELS)
+    """
+    Deux façons d'initier un paiement (voir escrow/services/providers/ — seul KPay
+    distingue vraiment les deux modes ; NotchPay reste toujours en page hébergée) :
+
+    - `phone_number` + `channel` fournis ensemble : paiement direct (push USSD chez KPay,
+      pré-remplissage chez NotchPay qui n'a pas de mode USSD).
+    - Aucun des deux fourni : mode page hébergée explicite (KPay : mode GATEWAY — Mobile
+      Money **et** cartes bancaires/PayPal sur la même page, l'acheteur choisit sur place).
+      `return_url` devient alors obligatoire : c'est le frontend (deep link app ou page web,
+      propre à son propre schéma) qui la fournit, pas le backend.
+    """
+
+    phone_number = serializers.CharField(
+        max_length=20, required=False, allow_blank=False
+    )
+    channel = serializers.ChoiceField(
+        choices=PaymentTransaction.CHANNELS, required=False
+    )
+    return_url = serializers.URLField(required=False)
+    cancel_url = serializers.URLField(required=False)
+
+    def validate(self, attrs):
+        has_channel = bool(attrs.get("channel"))
+        has_phone = bool(attrs.get("phone_number"))
+        if has_channel != has_phone:
+            raise serializers.ValidationError(
+                "phone_number et channel doivent être fournis ensemble (paiement direct), "
+                "ou omis tous les deux (page hébergée)."
+            )
+        if not has_channel and not attrs.get("return_url"):
+            raise serializers.ValidationError(
+                "return_url est obligatoire pour un paiement par page hébergée (sans "
+                "phone_number/channel)."
+            )
+        return attrs
