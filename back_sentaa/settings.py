@@ -166,6 +166,16 @@ CELERY_BEAT_SCHEDULE = {
         "task": "escrow.tasks.reconcile_pending_payouts",
         "schedule": crontab(minute="*/15"),  # tous les quarts d'heure
     },
+    # Réconciliation des collectes (paiement acheteur) restées `pending` trop longtemps —
+    # symétrique de reconcile-pending-payouts, côté entrée d'argent (voir escrow/models.py,
+    # contrainte unique_pending_collect_per_order, et escrow/tasks.py::reconcile_pending_
+    # collects). Cadence plus rapprochée que les payouts : un acheteur bloqué par le slot
+    # unique attend activement de pouvoir retenter son paiement, contrairement à un
+    # reversement où c'est Senta'a qui doit relancer.
+    "reconcile-pending-collects": {
+        "task": "escrow.tasks.reconcile_pending_collects",
+        "schedule": crontab(minute="*/10"),
+    },
 }
 
 # Seuils des rappels (notifications/tasks.py), ajustables sans redéploiement de code.
@@ -179,6 +189,17 @@ APPLICATION_REMINDER_DAYS = int(os.getenv("APPLICATION_REMINDER_DAYS", "5"))
 PAYOUT_RECONCILIATION_MINUTES = int(os.getenv("PAYOUT_RECONCILIATION_MINUTES", "30"))
 PAYOUT_RECONCILIATION_MAX_ATTEMPTS = int(
     os.getenv("PAYOUT_RECONCILIATION_MAX_ATTEMPTS", "5")
+)
+
+# Réconciliation/reprise des collectes (escrow/tasks.py::reconcile_pending_collects,
+# escrow/views.py::initiate_payment) : délai avant de considérer une collecte `pending` comme
+# abandonnée. En dessous du seuil, `initiate_payment` renvoie la session existante à l'acheteur
+# (reprise) ; au-dessus, la ligne est clôturée (`failed`) pour libérer le slot unique par
+# commande et permettre une nouvelle tentative. Même borne de tentatives que les payouts (pas
+# de retry infini silencieux).
+COLLECT_RECONCILIATION_MINUTES = int(os.getenv("COLLECT_RECONCILIATION_MINUTES", "30"))
+COLLECT_RECONCILIATION_MAX_ATTEMPTS = int(
+    os.getenv("COLLECT_RECONCILIATION_MAX_ATTEMPTS", "5")
 )
 
 AUTH_USER_MODEL = "users.User"

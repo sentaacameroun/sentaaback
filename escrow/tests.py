@@ -6,6 +6,9 @@ from decimal import Decimal
 from unittest.mock import Mock
 from unittest.mock import patch
 
+from django.conf import settings
+from django.db import IntegrityError
+from django.db import transaction
 from django.db.models.deletion import ProtectedError
 from django.test import override_settings
 from django.test import TestCase
@@ -34,6 +37,7 @@ from .services.providers import ProviderResult
 from .services.providers import STATUS_FAILED
 from .services.providers import STATUS_PENDING
 from .services.providers import STATUS_SUCCESSFUL
+from .tasks import reconcile_pending_collects
 from .tasks import reconcile_pending_payouts
 from logistics.geo import haversine_km
 from logistics.models import Delivery
@@ -146,6 +150,50 @@ class EscrowTests(APITestCase):
             order.delete()
         self.assertTrue(Order.objects.filter(id=order.id).exists())
         self.assertTrue(PaymentTransaction.objects.filter(id=txn.id).exists())
+
+    def test_unique_pending_collect_constraint_rejects_duplicate(self):
+        # Garde-fou DUR (contrainte unique en base, pas une simple garde applicative — règle
+        # #2 de .claude/rules/escrow-core.md) : au plus une collecte `pending` à la fois par
+        # commande. Sans elle, `initiate_payment` rappelé plusieurs fois pour la même commande
+        # (retry frontend, double-clic, utilisateur qui perd le fil d'un paiement déjà
+        # commencé) pouvait accumuler des collectes `pending` en parallèle.
+        order = self._create_order()
+        PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-1",
+            amount=1030,
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                PaymentTransaction.objects.create(
+                    order=order,
+                    transaction_type="collect",
+                    external_ref="ref-2",
+                    amount=1030,
+                    channel="mtn",
+                    phone_number="+237611000000",
+                    status="pending",
+                )
+        # Une fois la première collecte résolue (`failed`), le slot se libère : une nouvelle
+        # collecte `pending` redevient possible — contrairement à `release:{order.id}`, cette
+        # contrainte ne doit jamais bloquer une commande dont le premier paiement a échoué.
+        PaymentTransaction.objects.filter(external_ref="ref-1").update(status="failed")
+        PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-3",
+            amount=1030,
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+        self.assertEqual(
+            PaymentTransaction.objects.filter(order=order, status="pending").count(), 1
+        )
 
     @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
     def test_initiate_payment_creates_pending_transaction(self, mock_init):
@@ -310,6 +358,276 @@ class EscrowTests(APITestCase):
         self.assertEqual(
             PaymentTransaction.objects.get(order=order).provider_reference, ""
         )
+
+    # ----- Reprise d'un paiement déjà commencé -----
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_initiate_payment_reuses_recent_pending_transaction(self, mock_init):
+        # L'acheteur rappelle initiate_payment (retry frontend, double-clic, ou il a perdu le
+        # fil et revient reprendre le paiement) alors qu'une collecte `pending` récente existe
+        # déjà : pas de nouvelle session fournisseur, la session existante est renvoyée telle
+        # quelle.
+        mock_init.return_value = ProviderResult(
+            provider_reference="notch-ref-first",
+            status=STATUS_PENDING,
+            payment_flow=FLOW_REDIRECT,
+            checkout_url="https://pay.notchpay.co/notch-ref-first",
+            raw={"transaction": {"reference": "notch-ref-first"}},
+        )
+        order = self._create_order()
+
+        first = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+        second = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(mock_init.call_count, 1)  # un seul appel fournisseur
+        self.assertEqual(first.data, second.data)
+        self.assertEqual(
+            PaymentTransaction.objects.filter(order=order, status="pending").count(), 1
+        )
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_initiate_payment_replaces_expired_pending_transaction(
+        self, mock_init, mock_verify
+    ):
+        # Une collecte `pending` trop ancienne localement est revérifiée auprès du
+        # fournisseur avant d'être clôturée (`_resolve_stale_pending`) — jamais présumée
+        # `failed` sans confirmation (fiabilité webhook NotchPay documentée en PR 7). Ici le
+        # fournisseur confirme l'échec : la ligne est clôturée et remplacée.
+        mock_init.side_effect = [
+            ProviderResult(
+                provider_reference="notch-ref-old",
+                status=STATUS_PENDING,
+                raw={"transaction": {"reference": "notch-ref-old"}},
+            ),
+            ProviderResult(
+                provider_reference="notch-ref-new",
+                status=STATUS_PENDING,
+                raw={"transaction": {"reference": "notch-ref-new"}},
+            ),
+        ]
+        mock_verify.return_value = ProviderResult(
+            provider_reference="notch-ref-old",
+            status=STATUS_FAILED,
+            raw={"transaction": {"status": "failed"}},
+        )
+        order = self._create_order()
+
+        first = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+        old_txn = PaymentTransaction.objects.get(order=order, status="pending")
+        PaymentTransaction.objects.filter(pk=old_txn.pk).update(
+            created_at=timezone.now()
+            - timedelta(minutes=settings.COLLECT_RECONCILIATION_MINUTES + 1)
+        )
+
+        second = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(mock_init.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 1)
+        old_txn.refresh_from_db()
+        self.assertEqual(old_txn.status, "failed")
+        self.assertEqual(
+            PaymentTransaction.objects.get(
+                order=order, status="pending"
+            ).provider_reference,
+            "notch-ref-new",
+        )
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_initiate_payment_reuses_stale_pending_still_pending_per_provider(
+        self, mock_init, mock_verify
+    ):
+        # Le seuil local est dépassé mais le fournisseur confirme que le paiement est
+        # toujours en cours (webhook simplement en retard) : pas de remplacement, la session
+        # existante est renvoyée — jamais un nouvel appel fournisseur dans ce cas.
+        mock_init.return_value = ProviderResult(
+            provider_reference="notch-ref-slow",
+            status=STATUS_PENDING,
+            raw={"transaction": {"reference": "notch-ref-slow"}},
+        )
+        mock_verify.return_value = ProviderResult(
+            provider_reference="notch-ref-slow",
+            status=STATUS_PENDING,
+            raw={"transaction": {"status": "pending"}},
+        )
+        order = self._create_order()
+
+        first = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+        txn = PaymentTransaction.objects.get(order=order, status="pending")
+        PaymentTransaction.objects.filter(pk=txn.pk).update(
+            created_at=timezone.now()
+            - timedelta(minutes=settings.COLLECT_RECONCILIATION_MINUTES + 1)
+        )
+
+        second = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(mock_init.call_count, 1)
+        self.assertEqual(mock_verify.call_count, 1)
+        self.assertEqual(PaymentTransaction.objects.filter(order=order).count(), 1)
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_initiate_payment_detects_late_success_during_stale_check(
+        self, mock_init, mock_verify
+    ):
+        # Le fournisseur révèle, au moment de la revérification, que le paiement a en fait
+        # abouti (webhook perdu) : la commande doit être créditée exactement comme l'aurait
+        # fait le webhook, pas silencieusement perdue au profit d'une nouvelle tentative.
+        mock_init.return_value = ProviderResult(
+            provider_reference="notch-ref-late",
+            status=STATUS_PENDING,
+            raw={"transaction": {"reference": "notch-ref-late"}},
+        )
+        mock_verify.return_value = ProviderResult(
+            provider_reference="notch-ref-late",
+            status=STATUS_SUCCESSFUL,
+            raw={"transaction": {"status": "complete"}},
+        )
+        order = self._create_order()
+
+        self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+        txn = PaymentTransaction.objects.get(order=order, status="pending")
+        PaymentTransaction.objects.filter(pk=txn.pk).update(
+            created_at=timezone.now()
+            - timedelta(minutes=settings.COLLECT_RECONCILIATION_MINUTES + 1)
+        )
+
+        response = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        order.refresh_from_db()
+        txn.refresh_from_db()
+        self.assertEqual(order.status, "paid_escrow")
+        self.assertEqual(txn.status, "successful")
+        self.assertEqual(mock_init.call_count, 1)  # pas de 2e session ouverte
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_initiate_payment_marks_reserved_slot_failed_when_provider_call_fails(
+        self, mock_init
+    ):
+        # Le slot est réservé AVANT l'appel fournisseur (voir _reserve_collect_slot) : un
+        # échec de cet appel ne doit pas laisser la ligne `pending` indéfiniment (elle
+        # n'aurait de toute façon pas de provider_reference à réconcilier).
+        mock_init.side_effect = NotchPayError("provider indisponible")
+        order = self._create_order()
+
+        response = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        self.assertEqual(response.status_code, 502)
+        txn = PaymentTransaction.objects.get(order=order)
+        self.assertEqual(txn.status, "failed")
+        # Le slot est libre : une nouvelle tentative doit pouvoir réserver à nouveau.
+        self.assertIsNone(
+            PaymentTransaction.objects.filter(order=order, status="pending").first()
+        )
+
+    @patch("escrow.views._reserve_collect_slot", return_value=None)
+    def test_initiate_payment_returns_409_when_slot_reservation_loses_race(
+        self, mock_reserve
+    ):
+        # Exerce directement la branche qui absorbe la course concurrente résiduelle sur la
+        # contrainte unique (`_reserve_collect_slot` renvoie None quand le slot est déjà pris
+        # entre le check de lecture et l'INSERT) — sans dépendre du timing réel de deux
+        # threads/connexions séparées.
+        order = self._create_order()
+
+        response = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        mock_reserve.assert_called_once()
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_initiate_payment_persists_checkout_url_and_payment_flow(self, mock_init):
+        # Persisté à la création pour que `pending_payment`/la reprise puissent renvoyer la
+        # même session sans avoir à re-parser `raw_response` (spécifique au fournisseur).
+        mock_init.return_value = ProviderResult(
+            provider_reference="notch-ref-1",
+            status=STATUS_PENDING,
+            payment_flow=FLOW_REDIRECT,
+            checkout_url="https://pay.notchpay.co/notch-ref-1",
+            raw={"transaction": {"reference": "notch-ref-1"}},
+        )
+        order = self._create_order()
+        self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+        txn = PaymentTransaction.objects.get(order=order)
+        self.assertEqual(txn.payment_flow, "redirect")
+        self.assertEqual(txn.checkout_url, "https://pay.notchpay.co/notch-ref-1")
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.initialize_payment")
+    def test_pending_payment_returns_current_pending_transaction(self, mock_init):
+        mock_init.return_value = ProviderResult(
+            provider_reference="notch-ref-1",
+            status=STATUS_PENDING,
+            payment_flow=FLOW_REDIRECT,
+            checkout_url="https://pay.notchpay.co/notch-ref-1",
+            raw={"transaction": {"reference": "notch-ref-1"}},
+        )
+        order = self._create_order()
+        created = self.client.post(
+            f"/api/orders/{order.id}/initiate_payment/",
+            {"phone_number": "+237611000000", "channel": "mtn"},
+        )
+
+        response = self.client.get(f"/api/orders/{order.id}/pending_payment/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, created.data)
+        # Lecture seule : aucun nouvel appel fournisseur.
+        self.assertEqual(mock_init.call_count, 1)
+
+    def test_pending_payment_returns_404_when_none(self):
+        order = self._create_order()
+        response = self.client.get(f"/api/orders/{order.id}/pending_payment/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_pending_payment_forbidden_for_non_buyer(self):
+        order = self._create_order()
+        other = User.objects.create_user(
+            phone_number="+237699000000", first_name="Autre", last_name="Test"
+        )
+        self.client.force_authenticate(user=other)
+        response = self.client.get(f"/api/orders/{order.id}/pending_payment/")
+        self.assertIn(response.status_code, (403, 404))
 
     @staticmethod
     def _notchpay_webhook_body(merchant_reference, provider_reference=None):
@@ -933,6 +1251,143 @@ class PaymentSafetyTests(APITestCase):
 
         # 6e passage : la ligne a épuisé ses tentatives → exclue de la file, plus d'appel.
         reconcile_pending_payouts()
+        self.assertEqual(mock_verify.call_count, 5)
+
+    # ----- Réconciliation des collectes bloquées (reprise de paiement) -----
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    def test_reconcile_pending_collects_marks_successful_and_pays_escrow(
+        self, mock_verify
+    ):
+        # Utilisateur qui a perdu le fil d'un paiement déjà commencé : le webhook n'arrive
+        # jamais, mais le paiement a bien abouti côté fournisseur → la réconciliation doit
+        # faire progresser la commande exactement comme l'aurait fait le webhook (même chemin
+        # partagé, escrow/services/collect.py).
+        order = self._create_order()
+        txn = PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-stuck",
+            provider="notchpay",
+            provider_reference="notch-ref-stuck",
+            amount=Decimal("1530"),
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+        self._age(txn, minutes=60)
+        mock_verify.return_value = ProviderResult(
+            provider_reference="notch-ref-stuck",
+            status=STATUS_SUCCESSFUL,
+            raw={"transaction": {"status": "complete"}},
+        )
+
+        resolved = reconcile_pending_collects()
+
+        self.assertEqual(resolved, 1)
+        self.assertEqual(mock_verify.call_count, 1)
+        txn.refresh_from_db()
+        order.refresh_from_db()
+        self.assertEqual(txn.status, "successful")
+        self.assertTrue(txn.is_success)
+        self.assertEqual(order.status, "paid_escrow")
+        self.assertIsNotNone(order.paid_at)
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    def test_reconcile_pending_collects_marks_failed(self, mock_verify):
+        order = self._create_order()
+        txn = PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-ko",
+            provider="notchpay",
+            provider_reference="notch-ref-ko",
+            amount=Decimal("1530"),
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+        self._age(txn, minutes=60)
+        mock_verify.return_value = ProviderResult(
+            provider_reference="notch-ref-ko",
+            status=STATUS_FAILED,
+            raw={"transaction": {"status": "failed"}},
+        )
+
+        resolved = reconcile_pending_collects()
+
+        self.assertEqual(resolved, 1)
+        txn.refresh_from_db()
+        order.refresh_from_db()
+        self.assertEqual(txn.status, "failed")
+        self.assertEqual(order.status, "pending")
+        # Le slot est libéré : une nouvelle tentative de paiement redevient possible.
+        PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-retry",
+            amount=Decimal("1530"),
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    def test_reconcile_ignores_recent_pending_collect(self, mock_verify):
+        # Une collecte récente (sous le seuil) ne doit pas être touchée — c'est
+        # `initiate_payment` qui gère la reprise dans cette fenêtre, pas la réconciliation.
+        order = self._create_order()
+        PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-recent",
+            provider="notchpay",
+            provider_reference="notch-ref-recent",
+            amount=Decimal("1530"),
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+
+        reconcile_pending_collects()
+
+        mock_verify.assert_not_called()
+
+    @patch("escrow.services.providers.notchpay.NotchPayClient.verify_payment")
+    def test_reconcile_bounds_stuck_pending_collect_after_max_attempts(
+        self, mock_verify
+    ):
+        # Bornage : une collecte que le fournisseur rapporte indéfiniment `pending` est
+        # re-vérifiée au plus COLLECT_RECONCILIATION_MAX_ATTEMPTS (5) fois, puis sort de la
+        # file (pas de retry infini silencieux) — même garde que côté payout.
+        order = self._create_order()
+        txn = PaymentTransaction.objects.create(
+            order=order,
+            transaction_type="collect",
+            external_ref="ref-stuck-forever",
+            provider="notchpay",
+            provider_reference="notch-ref-stuck-forever",
+            amount=Decimal("1530"),
+            channel="mtn",
+            phone_number="+237611000000",
+            status="pending",
+        )
+        self._age(txn, minutes=60)
+        mock_verify.return_value = ProviderResult(
+            provider_reference="notch-ref-stuck-forever",
+            status=STATUS_PENDING,
+            raw={"transaction": {"status": "pending"}},
+        )
+
+        for _ in range(5):
+            reconcile_pending_collects()
+        self.assertEqual(mock_verify.call_count, 5)
+        txn.refresh_from_db()
+        self.assertEqual(txn.reconciliation_attempts, 5)
+        self.assertEqual(txn.status, "pending")
+
+        # 6e passage : la ligne a épuisé ses tentatives → exclue de la file, plus d'appel.
+        reconcile_pending_collects()
         self.assertEqual(mock_verify.call_count, 5)
 
     # ----- Signature du webhook NotchPay (MAJEUR #8) -----

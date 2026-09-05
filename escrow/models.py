@@ -103,6 +103,13 @@ class PaymentTransaction(models.Model):
         ("kpay", "KPay"),
         ("moneyfusion", "MoneyFusion"),
     )
+    # Reprise valeurs de escrow.services.providers.base.FLOW_REDIRECT/FLOW_USSD, dupliquées
+    # ici plutôt qu'importées (même choix que PROVIDERS/CHANNELS ci-dessus : le modèle ne
+    # dépend jamais de services/).
+    PAYMENT_FLOWS = (
+        ("redirect", "Page hébergée (redirection)"),
+        ("ussd", "Push USSD direct"),
+    )
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # PROTECT : le journal financier ne doit jamais être supprimé par cascade quand une
@@ -130,6 +137,13 @@ class PaymentTransaction(models.Model):
     # avant l'ajout de ce champ.
     provider = models.CharField(max_length=20, choices=PROVIDERS, blank=True)
     provider_reference = models.CharField(max_length=150, blank=True)
+    # Sous-ensemble normalisé de la `ProviderResult` reçue à la création d'une collecte
+    # (`initiate_payment`) — persisté pour permettre une vraie REPRISE de paiement plus tard
+    # (`OrderViewSet.pending_payment`, `_payment_response_payload`) sans avoir à re-parser
+    # `raw_response`, dont le format est spécifique à chaque fournisseur et n'est justement
+    # jamais censé quitter le backend (voir PR 7, réponse `initiate_payment` réduite).
+    checkout_url = models.URLField(max_length=500, blank=True)
+    payment_flow = models.CharField(max_length=10, choices=PAYMENT_FLOWS, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     channel = models.CharField(max_length=10, choices=CHANNELS)
     phone_number = models.CharField(max_length=20, blank=True)
@@ -140,12 +154,16 @@ class PaymentTransaction(models.Model):
     is_success = models.BooleanField(default=False)
     raw_response = models.JSONField(null=True, blank=True)  # Pour le debug/audit
 
-    # Nombre de passages de la tâche de réconciliation (escrow/tasks.py) sur ce reversement
-    # resté `pending`. Borne le nombre de re-vérifications (pas de retry infini silencieux) :
-    # au-delà du seuil, la ligne est sortie de la file et loggée pour intervention manuelle.
     reconciliation_attempts = models.PositiveSmallIntegerField(default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order"],
+                condition=models.Q(status="pending", transaction_type="collect"),
+                name="unique_pending_collect_per_order",
+            )
+        ]

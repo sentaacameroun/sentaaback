@@ -29,6 +29,7 @@ from django.utils import timezone
 
 from escrow.models import Order
 from escrow.models import PaymentTransaction
+from escrow.services.collect import apply_verified_collect_result
 from escrow.services.payouts import pay_courier_for_delivery
 from escrow.services.payouts import release_escrow_funds
 from escrow.services.providers import get_payment_client
@@ -237,3 +238,95 @@ def _bump_attempts(pk):
     return PaymentTransaction.objects.values_list(
         "reconciliation_attempts", flat=True
     ).get(pk=pk)
+
+
+@shared_task
+def reconcile_pending_collects():
+    """
+    Fait progresser les collectes (paiement acheteur) restées `pending` trop longtemps —
+    utilisateur qui a perdu le fil d'un paiement déjà commencé sans jamais le terminer côté
+    fournisseur, ou webhook jamais reçu. Sans cette tâche, la contrainte unique
+    `unique_pending_collect_per_order` (escrow/models.py) bloquerait indéfiniment toute
+    nouvelle tentative de paiement pour la commande concernée si aucun webhook n'arrive jamais
+    — même problème que celui déjà résolu pour les reversements (`reconcile_pending_payouts`,
+    ci-dessus), traité ici symétriquement côté collecte.
+
+    `initiate_payment` (escrow/views.py) couvre déjà le cas où l'acheteur revient lui-même
+    reprendre son paiement dans la fenêtre `COLLECT_RECONCILIATION_MINUTES` ; cette tâche
+    couvre le cas où personne ne revient (le slot doit quand même se libérer). Renvoie le
+    nombre de collectes résolues (`successful` ou `failed`).
+    """
+    minutes = settings.COLLECT_RECONCILIATION_MINUTES
+    max_attempts = settings.COLLECT_RECONCILIATION_MAX_ATTEMPTS
+    threshold = timezone.now() - timedelta(minutes=minutes)
+
+    stuck = PaymentTransaction.objects.filter(
+        transaction_type="collect",
+        status="pending",
+        created_at__lt=threshold,
+        reconciliation_attempts__lt=max_attempts,
+    ).exclude(provider_reference="")
+
+    resolved = 0
+    for txn in stuck:
+        # Même fournisseur que celui ayant réellement traité la collecte (voir
+        # _reconcile_pending ci-dessus pour la justification : PAYMENT_PROVIDER a pu changer
+        # depuis la création de cette ligne).
+        client = get_payment_client(txn.provider or None)
+        try:
+            result = client.verify_payment(txn.provider_reference)
+        except PaymentProviderError:
+            attempts = _bump_attempts(txn.pk)
+            logger.warning(
+                "Réconciliation collecte : verify_payment (%s) a échoué pour %s (ref %s, "
+                "tentative %s/%s)",
+                client.name,
+                txn.id,
+                txn.provider_reference,
+                attempts,
+                max_attempts,
+            )
+            if attempts >= max_attempts:
+                logger.error(
+                    "Réconciliation collecte : paiement %s injoignable après %s tentatives "
+                    "(ref %s, order %s) — intervention manuelle requise",
+                    txn.id,
+                    attempts,
+                    txn.provider_reference,
+                    txn.order_id,
+                )
+            continue
+
+        with transaction.atomic():
+            locked = PaymentTransaction.objects.select_for_update().get(pk=txn.pk)
+            if locked.status != "pending":
+                # Résolue entre-temps (webhook, ou reprise par l'acheteur) : idempotent.
+                continue
+            locked.reconciliation_attempts += 1
+            locked.save(update_fields=["reconciliation_attempts"])
+            # Point d'entrée unique de la transition pending -> successful/failed (+
+            # paid_escrow), partagé avec le webhook — voir escrow/services/collect.py.
+            apply_verified_collect_result(locked, result)
+            final_status = locked.status
+            attempts_after = locked.reconciliation_attempts
+
+        if final_status in ("successful", "failed"):
+            resolved += 1
+            if final_status == "failed":
+                logger.error(
+                    "Réconciliation collecte : paiement %s marqué FAILED par le fournisseur "
+                    "(order %s, ref %s) — l'acheteur doit retenter",
+                    txn.id,
+                    txn.order_id,
+                    txn.provider_reference,
+                )
+        elif attempts_after >= max_attempts:
+            logger.error(
+                "Réconciliation collecte : paiement %s toujours 'pending' après %s "
+                "tentatives (order %s, ref %s) — intervention manuelle requise",
+                txn.id,
+                attempts_after,
+                txn.order_id,
+                txn.provider_reference,
+            )
+    return resolved

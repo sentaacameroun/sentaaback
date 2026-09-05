@@ -331,6 +331,88 @@ choix Mobile Money, comme documenté sur https://kpay.site/documentation/cartes-
 Non fait, volontairement hors scope : NotchPay n'a pas de second mode dans ce repo (toujours
 page hébergée) — aucune tentative de lui ajouter un mode direct/USSD, non demandé.
 
+## PR 8 — Idempotence des collectes (reprise de paiement)
+Statut : ☑ terminé (2026-09-03) — `pytest` nu = **210 passed** ; `ruff check .` clean ;
+`black --check .` clean (fichiers touchés) ; `manage.py makemigrations --check --dry-run` = no
+changes. Revue `escrow-reviewer` (2 passages) : **APPROUVÉ**, aucun point bloquant.
+
+Origine : question directe du développeur (hors cycle `/refactor-prX`, pas de commande
+dédiée) en observant que l'idempotence de `PaymentTransaction` (`idempotency_key`, PR 2/PR 3)
+ne couvre que les **sorties** de fonds (`release`, `courier_payout`) — jamais la collecte
+(paiement acheteur). Rien n'empêchait `initiate_payment` d'être rappelé plusieurs fois pour la
+même commande (retry frontend, double-clic, utilisateur qui a perdu le fil d'un paiement déjà
+commencé et revient le reprendre) : chaque appel ouvrait une nouvelle session fournisseur et
+créait une nouvelle `PaymentTransaction` `collect` `pending`, sans jamais réutiliser ni clôturer
+les précédentes. Aucune reprise possible, transactions `pending` orphelines jamais réconciliées
+(`reconcile_pending_payouts` ne couvrait que `withdraw`/`courier_payout`), et un risque latent
+de double crédit si deux sessions concurrentes étaient toutes deux menées à terme côté
+acheteur.
+
+- [x] **Contrainte unique partielle** `unique_pending_collect_per_order`
+      (`escrow/models.py`, migration `0012`) : au plus une collecte `pending` à la fois par
+      commande, garde-fou DUR (règle #2, `.claude/rules/escrow-core.md`), pas une simple garde
+      applicative. Index partiel (condition sur `status="pending"` ET
+      `transaction_type="collect"`) plutôt qu'une `idempotency_key` fixe comme `release:
+      {order.id}` : contrairement à un release, une collecte doit pouvoir être retentée une
+      fois l'ancienne résolue (`successful`/`failed`) — le slot se libère alors
+      automatiquement. Testé (`test_unique_pending_collect_constraint_rejects_duplicate`).
+- [x] **`initiate_payment` réécrit** (`escrow/views.py`) :
+      - Reprise : une collecte `pending` récente (< `COLLECT_RECONCILIATION_MINUTES`) est
+        renvoyée telle quelle plutôt que d'en ouvrir une seconde.
+      - Slot réservé **avant** tout appel fournisseur (`_reserve_collect_slot`, INSERT en
+        savepoint + `except IntegrityError`), puis complété (`provider`/`provider_reference`/
+        `payment_flow`/`checkout_url`) une fois l'appel résolu — **pas** l'inverse. Correctif
+        trouvé par `escrow-reviewer` sur la 1ère version de cette PR : appeler le fournisseur
+        avant de réserver le slot laissait deux requêtes concurrentes déclencher chacune un
+        VRAI appel fournisseur (ex. deux push USSD au même acheteur) avant que la contrainte
+        ne tranche seulement l'écriture — la session perdante, jamais persistée, devenait un
+        paiement fantôme si l'acheteur la complétait quand même (webhook sans transaction à
+        créditer). Sur échec fournisseur, la ligne réservée est explicitement clôturée
+        `failed` (sinon invisible à la réconciliation, qui exclut les lignes sans
+        `provider_reference`).
+      - Une collecte `pending` expirée localement est **revérifiée auprès du fournisseur**
+        avant d'être clôturée (`_resolve_stale_pending`), jamais présumée `failed` sans
+        confirmation — 2e correctif `escrow-reviewer` : les webhooks NotchPay sont documentés
+        peu fiables en prod (PR 7) ; déclarer `failed` un paiement en réalité réussi aurait
+        fait ignorer silencieusement le webhook tardif correspondant. Trois issues gérées :
+        `successful` (commande créditée, pas de nouvelle session), `pending` (réutilisée),
+        `failed` (slot libéré).
+      - Bug latent corrigé au passage : `reference` était générée via
+        `int(timezone.now().timestamp())` (précision à la seconde) — deux appels à
+        `initiate_payment` pour la même commande dans la même seconde généraient la même
+        `reference`, en collision sur `PaymentTransaction.external_ref` (unique). Révélé en
+        écrivant le test de remplacement d'une pending expirée. Remplacé par un suffixe
+        `uuid4`.
+- [x] **`escrow/services/collect.py`** (nouveau) : `apply_verified_collect_result(txn,
+      verified)` factorise la transition `pending -> successful/failed` (+ `paid_escrow` sur
+      succès) — point d'entrée unique partagé par `_CollectWebhookView._process` **et** la
+      nouvelle tâche de réconciliation, pour ne jamais dupliquer cette logique (même principe
+      que la règle #3 de `.claude/rules/escrow-core.md`, appliqué ici à `paid_escrow` plutôt
+      qu'à la clôture de commande).
+- [x] **`GET /orders/{id}/pending_payment/`** (`escrow/views.py`) : lecture seule de la
+      collecte `pending` en cours pour une commande, sans déclencher d'appel fournisseur —
+      permet au frontend de retrouver une session déjà commencée. Permission objet identique à
+      `initiate_payment` (buyer uniquement). 404 si rien en cours.
+- [x] **`reconcile_pending_collects`** (`escrow/tasks.py`, beat `*/10`) : symétrique de
+      `reconcile_pending_payouts` côté collecte — fait converger les `pending` bloqués (webhook
+      jamais arrivé) via `verify_payment`, même bornage anti-retry-infini
+      (`COLLECT_RECONCILIATION_MAX_ATTEMPTS`). Sans cette tâche, la contrainte unique
+      bloquerait indéfiniment toute nouvelle tentative de paiement si personne ne revient
+      relancer `initiate_payment`.
+- [x] Settings `COLLECT_RECONCILIATION_MINUTES`/`_MAX_ATTEMPTS` (`back_sentaa/settings.py`,
+      `.env.example`), mêmes valeurs par défaut que les payouts (30 min / 5 tentatives).
+
+Point mineur résiduel, non bloquant (relevé par `escrow-reviewer`) : entre la réservation du
+slot et sa mise à jour post-appel fournisseur, un lecteur concurrent (`pending_payment` ou une
+2e requête `initiate_payment`) peut lire un payload transitoire avec `payment_flow`/
+`checkout_url` encore vides — fenêtre de l'ordre de la latence réseau vers le fournisseur,
+aucun impact financier (pas de second appel fournisseur déclenché). À surveiller si le
+frontend doit un jour gérer ce cas ; ne justifiait pas de bloquer cette PR.
+
+Fichiers touchés : `escrow/models.py`, `escrow/migrations/0012_paymenttransaction_checkout_url_
+and_more.py`, `escrow/services/collect.py` (nouveau), `escrow/views.py`, `escrow/tasks.py`,
+`escrow/tests.py`, `back_sentaa/settings.py`, `.env.example`.
+
 ## Questions ouvertes restantes
 Voir `docs/AUDIT_BACKEND.md` §9. Un agent ne doit jamais trancher ces
 questions seul — elles doivent être posées explicitement au développeur.
