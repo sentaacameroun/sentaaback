@@ -108,7 +108,7 @@ jobs:
           command_timeout: 20m
           script: |
             set -euo pipefail
-            cd /var/www/sentaa-backend-dev
+            cd /var/www/sentaa-backend-dev/sentaaback
 
             git fetch origin
             git reset --hard origin/dev
@@ -141,7 +141,7 @@ jobs:
           command_timeout: 20m
           script: |
             set -euo pipefail
-            cd /var/www/sentaa-backend
+            cd /var/www/sentaa-backend/sentaaback
 
             git fetch origin
             git reset --hard origin/main
